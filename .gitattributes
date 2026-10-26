@@ -1,0 +1,3 @@
+# GitHub's language bar: count our code only. vendor/ (the nx crate) is vendored by Linguist's defaults.
+overlay/libultrahand/** linguist-vendored
+relay/worker-configuration.d.ts linguist-generated
