@@ -1,0 +1,5 @@
+# nightly: the Horizon target (aarch64-nintendo-switch-freestanding) needs -Zbuild-std.
+# Pinned so a new nightly cannot break a release build; bump deliberately.
+[toolchain]
+channel = "nightly-2026-10-25"
+components = ["rust-src", "clippy", "rustfmt", "llvm-tools"]

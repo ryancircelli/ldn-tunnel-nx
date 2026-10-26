@@ -1,0 +1,24 @@
+name = "ldn-tunnel"
+main = "src/cloudflare/worker.ts"
+compatibility_date = "2026-10-01"
+
+[[durable_objects.bindings]]
+name = "LOBBY"
+class_name = "Lobby"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Lobby"] # the free plan only allows SQLite-backed objects
+
+[observability]
+enabled = true
+
+[vars]
+# The update button on /admin redeploys this Worker by name (with the CF_API_TOKEN and CF_ACCOUNT_ID
+# secrets). If you gave the Worker another name when you deployed it, put that name here.
+CF_WORKER_NAME = "ldn-tunnel"
+
+[[rules]] # ship the CA roots with the Worker (.txt is already a Text module by default)
+type = "Text"
+globs = ["**/*.pem"]
+fallthrough = true

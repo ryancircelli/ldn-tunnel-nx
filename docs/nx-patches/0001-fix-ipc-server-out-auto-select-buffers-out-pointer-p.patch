@@ -1,0 +1,189 @@
+From ceb97ab9056aff5d508e0717175320e002bbfb69 Mon Sep 17 00:00:00 2001
+From: Ryan Circelli <ryancircelli@gmail.com>
+Date: Sun, 25 Oct 2026 13:03:58 -0400
+Subject: [PATCH 1/3] fix(ipc/server): out auto-select buffers, out-pointer
+ placement and bounds
+
+Server-side handling of out buffers had three problems:
+
+- An out auto-select buffer sent as a C descriptor (the client's choice
+  whenever it fits the pointer buffer) was handed to the handler at the
+  client's own address, which is meaningless in the server's address
+  space, and nothing sent the data back. It now gets space in the pointer
+  buffer and goes back as an X descriptor with the C descriptor's
+  receive-list index, which the kernel copies into the client's buffer.
+  Its out-pointer size entry is consumed either way.
+- Out-pointer space started at offset 0 of the pointer buffer, on top of
+  the request's own X data, so an out buffer overwrote in-buffers the
+  handler had not read yet. It now starts after the last X descriptor,
+  like Atmosphere's HipcCommandProcessor.
+- Out-pointer sizes come from the client and were not checked against
+  the pointer buffer. CommandContext::new_server now takes its size and
+  allocation fails with InvalidBufferPointer past the end.
+
+Empty auto-select buffers (both descriptors null, e.g. a NULL address
+argument) are now passed to the handler as empty instead of failing the
+request with InvalidBufferAttributes.
+
+Signed-off-by: Ryan Circelli <ryancircelli@gmail.com>
+---
+ src/ipc.rs             | 62 ++++++++++++++++++++++++++++++++++++++----
+ src/ipc/cmif/server.rs |  1 +
+ src/ipc/server.rs      |  1 +
+ 3 files changed, 59 insertions(+), 5 deletions(-)
+
+diff --git a/src/ipc.rs b/src/ipc.rs
+index fad7138..d58f2f9 100755
+--- a/src/ipc.rs
++++ b/src/ipc.rs
+@@ -667,8 +667,10 @@ pub struct CommandContext {
+     receive_buffers: ArrayVec<BufferDescriptor, MAX_COUNT>,
+     exchange_buffers: ArrayVec<BufferDescriptor, MAX_COUNT>,
+     pointer_buffer: *mut u8,
++    pointer_buffer_size: usize,
+     in_pointer_buffer_offset: usize,
+     out_pointer_buffer_offset: usize,
++    receive_static_index: u32,
+     pointer_size_walker: DataWalker,
+     pointer_size_walker_initialized: bool,
+ }
+@@ -685,8 +687,10 @@ impl CommandContext {
+             receive_buffers: ArrayVec::new(),
+             exchange_buffers: ArrayVec::new(),
+             pointer_buffer: core::ptr::null_mut(),
++            pointer_buffer_size: 0,
+             in_pointer_buffer_offset: 0,
+             out_pointer_buffer_offset: 0,
++            receive_static_index: 0,
+             pointer_size_walker: DataWalker::empty(),
+             pointer_size_walker_initialized: false,
+         }
+@@ -718,13 +722,45 @@ impl CommandContext {
+         }
+     }
+ 
+-    pub fn new_server(object_info: ObjectInfo, pointer_buffer: *mut u8) -> Self {
++    pub fn new_server(
++        object_info: ObjectInfo,
++        pointer_buffer: *mut u8,
++        pointer_buffer_size: usize,
++    ) -> Self {
+         let mut ctx = Self::empty();
+         ctx.object_info = object_info;
+         ctx.pointer_buffer = pointer_buffer;
++        ctx.pointer_buffer_size = pointer_buffer_size;
+         ctx
+     }
+ 
++    /// Server side: out-pointer data goes after the request's own X data in the pointer buffer
++    /// (the kernel placed it there on receive), never over it, as Atmosphere's `HipcCommandProcessor`.
++    pub(crate) fn start_out_pointers_after_send_statics(&mut self) {
++        let base = self.pointer_buffer.addr();
++        let tail = self
++            .send_statics
++            .iter()
++            .map(|desc| desc.get_address().addr() + desc.get_size())
++            .filter(|&end| end > base)
++            .map(|end| end - base)
++            .max()
++            .unwrap_or(0);
++        self.out_pointer_buffer_offset = tail.next_multiple_of(0x10);
++    }
++
++    /// Server side: carves `size` bytes for out-pointer data from the pointer buffer, bounds-checked.
++    fn allocate_out_pointer(&mut self, size: usize) -> Result<*mut u8> {
++        let end = self.out_pointer_buffer_offset.saturating_add(size);
++        result_return_unless!(
++            end <= self.pointer_buffer_size,
++            rc::ResultInvalidBufferPointer
++        );
++        let buf = unsafe { self.pointer_buffer.add(self.out_pointer_buffer_offset) };
++        self.out_pointer_buffer_offset = end.next_multiple_of(0x10);
++        Ok(buf)
++    }
++
+     fn add_send_static(&mut self, send_static: SendStaticDescriptor) -> Result<()> {
+         match self.send_statics.try_push(send_static) {
+             Ok(()) => Ok(()),
+@@ -891,7 +927,10 @@ impl CommandContext {
+ 
+     fn pop_receive_static(&mut self) -> Result<ReceiveStaticDescriptor> {
+         match self.receive_statics.pop_at(0) {
+-            Some(receive_static) => Ok(receive_static),
++            Some(receive_static) => {
++                self.receive_static_index += 1;
++                Ok(receive_static)
++            }
+             None => rc::ResultInvalidReceiveStaticCount::make_err(),
+         }
+     }
+@@ -942,17 +981,31 @@ impl CommandContext {
+                     if !send_desc.get_address().is_null() && (send_desc.get_size() > 0) {
+                         return Ok((send_desc.get_address(), send_desc.get_size()));
+                     }
++                    // An empty buffer (e.g. a NULL address argument) is valid.
++                    return Ok((ptr::null_mut(), 0));
+                 }
+             } else if OUT
+                 && let Ok(static_desc) = self.pop_receive_static()
+                 && let Ok(recv_desc) = self.pop_receive_buffer()
+             {
++                // Every auto-select out buffer has an out-pointer size entry, used or not;
++                // skip it so later out-pointer buffers read their own.
++                self.ensure_pointer_size_walker(raw_data_walker);
++                let _ = self.pointer_size_walker.advance_get::<u16>();
+                 if !static_desc.get_address().is_null() && (static_desc.get_size() > 0) {
+-                    return Ok((static_desc.get_address(), static_desc.get_size()));
++                    // The C descriptor names the client's buffer in the client's address space:
++                    // write into our pointer buffer and send it back as an X descriptor with the
++                    // same receive-list index, which the kernel copies into the client's buffer.
++                    let size = static_desc.get_size();
++                    let buf = self.allocate_out_pointer(size)?;
++                    let index = self.receive_static_index - 1;
++                    self.add_send_static(SendStaticDescriptor::new(buf, size, index))?;
++                    return Ok((buf, size));
+                 }
+                 if !recv_desc.get_address().is_null() && (recv_desc.get_size() > 0) {
+                     return Ok((recv_desc.get_address(), recv_desc.get_size()));
+                 }
++                return Ok((ptr::null_mut(), 0));
+             }
+         } else if POINTER {
+             if IN && let Ok(static_desc) = self.pop_send_static() {
+@@ -966,8 +1019,7 @@ impl CommandContext {
+                     }
+                 };
+ 
+-                let buf = unsafe { self.pointer_buffer.add(self.out_pointer_buffer_offset) };
+-                self.out_pointer_buffer_offset += buf_size;
++                let buf = self.allocate_out_pointer(buf_size)?;
+                 return Ok((buf, buf_size));
+             }
+         } else if MAP_ALIAS {
+diff --git a/src/ipc/cmif/server.rs b/src/ipc/cmif/server.rs
+index e94ede4..bf7a00d 100755
+--- a/src/ipc/cmif/server.rs
++++ b/src/ipc/cmif/server.rs
+@@ -34,6 +34,7 @@ pub fn read_command_from_msg_buffer(ctx: &mut CommandContext) -> CommandType {
+ 
+         let send_static_count = (*command_header).get_send_static_count();
+         ipc_buf = read_array_from_buffer(ipc_buf, send_static_count, &mut ctx.send_statics);
++        ctx.start_out_pointers_after_send_statics();
+         let send_buffer_count = (*command_header).get_send_buffer_count();
+         ipc_buf = read_array_from_buffer(ipc_buf, send_buffer_count, &mut ctx.send_buffers);
+         let receive_buffer_count = (*command_header).get_receive_buffer_count();
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index b88e5e3..8f74bf5 100755
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -954,6 +954,7 @@ impl<const P: usize> ServerManager<P> {
+                         ctx = CommandContext::new_server(
+                             server_info,
+                             self.pointer_buffer.as_mut_ptr(),
++                            P,
+                         );
+                         command_type = cmif::server::read_command_from_msg_buffer(&mut ctx);
+                         match command_type {
+-- 
+2.34.1
+

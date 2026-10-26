@@ -1,0 +1,92 @@
+From 2dee30efee687946e80650eae97f296c5d3fc8fc Mon Sep 17 00:00:00 2001
+From: Ryan Circelli <ryancircelli@gmail.com>
+Date: Sun, 25 Oct 2026 20:59:51 -0400
+Subject: [PATCH] fix(nx/ipc): size auto-select out pointers from the
+ out-pointer size table
+
+A server never sees the client's receive list: the kernel copies the
+header, special data, X/A/B/W descriptors and raw data of a request, but
+not the C descriptors after them. pop_buffer took an auto-select out
+buffer's mode and size from those C descriptor words anyway, so it read
+whatever an earlier message left in TLS. Usually that is 0: the handler
+got an empty buffer and the reply's X descriptor had size 0, so every
+proxied recv/recvfrom delivered 0 bytes (and select/poll/getsockopt out
+buffers on proxied paths came back unwritten).
+
+Do what Atmosphere's HipcCommandProcessor does: a B descriptor with an
+address means map alias (reply with an empty X descriptor at the
+buffer's receive index); otherwise the size is the client's entry in the
+out-pointer size table, carved from the pointer buffer and sent back as
+an X descriptor with the buffer's receive index. The index is counted
+per out buffer instead of per C descriptor popped.
+
+Signed-off-by: Ryan Circelli <ryancircelli@gmail.com>
+---
+ src/ipc.rs | 41 ++++++++++++++++++-----------------------
+ 1 file changed, 18 insertions(+), 23 deletions(-)
+
+diff --git a/src/ipc.rs b/src/ipc.rs
+index d58f2f9..c77c9e9 100755
+--- a/src/ipc.rs
++++ b/src/ipc.rs
+@@ -927,10 +927,7 @@ impl CommandContext {
+ 
+     fn pop_receive_static(&mut self) -> Result<ReceiveStaticDescriptor> {
+         match self.receive_statics.pop_at(0) {
+-            Some(receive_static) => {
+-                self.receive_static_index += 1;
+-                Ok(receive_static)
+-            }
++            Some(receive_static) => Ok(receive_static),
+             None => rc::ResultInvalidReceiveStaticCount::make_err(),
+         }
+     }
+@@ -984,28 +981,26 @@ impl CommandContext {
+                     // An empty buffer (e.g. a NULL address argument) is valid.
+                     return Ok((ptr::null_mut(), 0));
+                 }
+-            } else if OUT
+-                && let Ok(static_desc) = self.pop_receive_static()
+-                && let Ok(recv_desc) = self.pop_receive_buffer()
+-            {
+-                // Every auto-select out buffer has an out-pointer size entry, used or not;
+-                // skip it so later out-pointer buffers read their own.
++            } else if OUT && let Ok(recv_desc) = self.pop_receive_buffer() {
++                // As Atmosphere's HipcCommandProcessor: a B descriptor with an address means the
++                // client chose map alias; otherwise the size is the client's entry in the
++                // out-pointer size table. The C descriptors are never read: the kernel does not
++                // copy the client's receive list into our message, what sits there is stale words
++                // of an earlier message (usually 0, which gave the handler an empty buffer).
++                let _ = self.pop_receive_static();
++                let index = self.receive_static_index;
++                self.receive_static_index += 1;
+                 self.ensure_pointer_size_walker(raw_data_walker);
+-                let _ = self.pointer_size_walker.advance_get::<u16>();
+-                if !static_desc.get_address().is_null() && (static_desc.get_size() > 0) {
+-                    // The C descriptor names the client's buffer in the client's address space:
+-                    // write into our pointer buffer and send it back as an X descriptor with the
+-                    // same receive-list index, which the kernel copies into the client's buffer.
+-                    let size = static_desc.get_size();
+-                    let buf = self.allocate_out_pointer(size)?;
+-                    let index = self.receive_static_index - 1;
+-                    self.add_send_static(SendStaticDescriptor::new(buf, size, index))?;
+-                    return Ok((buf, size));
+-                }
+-                if !recv_desc.get_address().is_null() && (recv_desc.get_size() > 0) {
++                let size = self.pointer_size_walker.advance_get::<u16>() as usize;
++                if !recv_desc.get_address().is_null() {
++                    self.add_send_static(SendStaticDescriptor::new(ptr::null(), 0, index))?;
+                     return Ok((recv_desc.get_address(), recv_desc.get_size()));
+                 }
+-                return Ok((ptr::null_mut(), 0));
++                // Written into our pointer buffer and sent back as an X descriptor with this
++                // buffer's receive-list index; the kernel copies it into the client's C buffer.
++                let buf = self.allocate_out_pointer(size)?;
++                self.add_send_static(SendStaticDescriptor::new(buf, size, index))?;
++                return Ok((if size > 0 { buf } else { ptr::null_mut() }, size));
+             }
+         } else if POINTER {
+             if IN && let Ok(static_desc) = self.pop_send_static() {
+-- 
+2.34.1
+

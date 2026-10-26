@@ -1,0 +1,79 @@
+From 0fe7cb75c32a13366927759559ac06768303b197 Mon Sep 17 00:00:00 2001
+From: Ryan Circelli <ryancircelli@gmail.com>
+Date: Sun, 25 Oct 2026 20:01:12 -0400
+Subject: [PATCH] fix(nx/ipc): receive all X data in one buffer, survive
+ undeliverable requests
+
+The server advertised its pointer buffer as a receive list of one indexed
+entry (mode 3). The kernel then places each X descriptor by its index, and
+an index >= 1 (the second in-pointer of SendTo, Select's other fd_sets...)
+has no entry: the request fails with ResultOutOfResource (0xCE01) on the
+client, which the SDK aborts on, and svcReplyAndReceive returns
+ResultNotFound to the server. The manager passed that up as an error and
+the MitM thread ended, closing every client session (the SDK aborts again,
+on sf::hipc::ResultSessionClosed 0x25A0B).
+
+Use receive list mode 2, one buffer for all X data, as libnx's
+HIPC_AUTO_RECV_STATIC and Atmosphere's servers do; X data still lands at
+the descriptor addresses the server reads and out-pointers still start
+after it. Treat ResultNotFound and ResultReceiveListBroken from the
+receive as nothing to dispatch: the kernel has already failed the request
+to its client (Atmosphere's ReceiveResult::NeedsRetry).
+
+Signed-off-by: Ryan Circelli <ryancircelli@gmail.com>
+---
+ src/ipc/server.rs | 16 ++++++++++++++++
+ src/svc/rc.rs     |  4 +++-
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index 8c9ee46..5b8ad50 100755
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -1043,12 +1043,28 @@ impl<const P: usize> ServerManager<P> {
+                                 cmif::CommandType::Invalid,
+                                 0,
+                             );
++                            // One receive buffer for every X descriptor (receive list mode 2,
++                            // libnx's HIPC_AUTO_RECV_STATIC), as Atmosphere's servers. The count
++                            // of 1 above encodes index mode with a single entry, where the kernel
++                            // fails any X descriptor with index >= 1 (the second in-pointer of
++                            // SendTo, Select...): the client gets ResultOutOfResource.
++                            unsafe {
++                                let word = get_msg_buffer().cast::<u32>().add(1);
++                                *word = (*word & !(0xF << 10)) | (2 << 10);
++                            }
+                         }
+ 
+                         if let Err(rc) = unsafe { svc::reply_and_receive(&handle, 1, 0, -1) } {
+                             if svc::rc::ResultSessionClosed::matches(rc) {
+                                 should_close_session = true;
+                                 break;
++                            } else if svc::rc::ResultNotFound::matches(rc)
++                                || svc::rc::ResultReceiveListBroken::matches(rc)
++                            {
++                                // The kernel could not deliver this request (its buffers did not
++                                // fit) and already failed it to the client: nothing to dispatch,
++                                // the session stays open (Atmosphere's ReceiveResult::NeedsRetry).
++                                break;
+                             } else {
+                                 return Err(rc);
+                             }
+diff --git a/src/svc/rc.rs b/src/svc/rc.rs
+index 31a4e5e..0ab009a 100755
+--- a/src/svc/rc.rs
++++ b/src/svc/rc.rs
+@@ -9,7 +9,9 @@ result_define_group!(RESULT_MODULE => {
+     InvalidHandle: 114,
+     TimedOut: 117,
+     Cancelled: 118,
++    NotFound: 121,
+     SessionClosed: 123,
+     NotHandled: 124,
+-    Debug: 128
++    Debug: 128,
++    ReceiveListBroken: 258
+ });
+-- 
+2.34.1
+

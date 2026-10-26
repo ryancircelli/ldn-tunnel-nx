@@ -1,0 +1,480 @@
+From 13a5c98ec60c78f914639583b2775fc5fcc4c39a Mon Sep 17 00:00:00 2001
+From: Ryan Circelli <ryancircelli@gmail.com>
+Date: Sun, 25 Oct 2026 13:09:32 -0400
+Subject: [PATCH 3/3] feat(ipc/server): deferred requests and blocking waits
+
+A handler can set ServerContext::defer to hold its request unanswered;
+the manager saves the message and pointer buffer, keeps serving other
+sessions, and re-dispatches the request (ServerContext::resumed) when
+the deferral's handle signals or its deadline passes. This lets one
+server thread serve blocking calls (async forwards, socket waits)
+without stalling every other session.
+
+Also:
+- the manager waits with no timeout when nothing is deferred, instead
+  of waking every 100us;
+- prepare_wait_handles never writes past MAX_OBJECT_COUNT;
+- ISessionObject::on_session_closed (default no-op) tells the object
+  which session closed, so per-session state can be dropped.
+
+Signed-off-by: Ryan Circelli <ryancircelli@gmail.com>
+---
+ src/ipc/server.rs | 265 ++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 207 insertions(+), 58 deletions(-)
+
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index 404cc97..a6670dc 100755
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -1,5 +1,6 @@
+ use super::*;
+ use crate::sync::Mutex;
++use crate::arm;
+ use crate::wait;
+ use alloc::rc::Rc;
+ use alloc::vec::Vec;
+@@ -24,6 +25,28 @@ pub mod rc;
+ 
+ const MAX_COUNT: usize = wait::MAX_OBJECT_COUNT as usize;
+ 
++/// Asks the server manager to hold the current request without replying, and to dispatch it
++/// again (same message, same pointer-buffer contents, [`ServerContext::resumed`] set) once
++/// `wait_handle` signals or `deadline` passes, whichever comes first.
++///
++/// `wait_handle` must be a readable event (or async-request event) the handler owns. When it
++/// signals, the manager clears it (`svcResetSignal`) and then resumes every request deferred on
++/// it, so several sessions can share one event without losing a wakeup: anything that happens
++/// after the clear signals it again.
++#[derive(Copy, Clone, Debug)]
++pub struct Deferral {
++    /// Handle to wait on, or [`svc::INVALID_HANDLE`] for a pure timeout.
++    pub wait_handle: svc::Handle,
++    /// Absolute deadline in system ticks ([`crate::arm::get_system_tick`]); `u64::MAX` for none.
++    pub deadline: u64,
++}
++
++struct DeferredRequest {
++    deferral: Deferral,
++    msg: [u8; 0x100],
++    pointer_data: Vec<u8>,
++}
++
+ pub struct ServerContext<'ctx> {
+     pub ctx: &'ctx mut CommandContext,
+     pub raw_data_walker: DataWalker,
+@@ -33,6 +56,11 @@ pub struct ServerContext<'ctx> {
+     /// (from `AtmosphereAcknowledgeMitmSession`, or its clone). Borrowed: the server closes it.
+     /// Empty (handle 0) otherwise.
+     pub mitm_forward: ObjectInfo,
++    /// Set by a handler to hold this request instead of replying (see [`Deferral`]).
++    /// Ignored if the handler returns an error.
++    pub defer: Option<Deferral>,
++    /// True when this dispatch resumes a request the handler deferred earlier.
++    pub resumed: bool,
+ }
+ 
+ impl<'ctx> ServerContext<'ctx> {
+@@ -48,6 +76,8 @@ impl<'ctx> ServerContext<'ctx> {
+             domain_table,
+             new_sessions,
+             mitm_forward: ObjectInfo::new(),
++            defer: None,
++            resumed: false,
+         }
+     }
+ }
+@@ -246,6 +276,11 @@ pub trait ISessionObject {
+         protocol: CommandProtocol,
+         server_ctx: &mut ServerContext,
+     ) -> Option<Result<()>>;
++
++    /// Called when a session served by this object closes (client gone or explicit close),
++    /// including one with a deferred request. Clones of a session share the object, so the
++    /// handle says which one closed.
++    fn on_session_closed(&mut self, _handle: svc::Handle) {}
+ }
+ 
+ pub trait IServerObject: ISessionObject {
+@@ -352,6 +387,7 @@ pub struct ServerHolder {
+     pub is_mitm_service: bool,
+     pub service_name: sm::ServiceName,
+     pub domain_table: Option<Rc<Mutex<DomainTable>>>,
++    deferred: Option<DeferredRequest>,
+ }
+ 
+ impl ServerHolder {
+@@ -363,6 +399,7 @@ impl ServerHolder {
+             new_mitm_server_fn: None,
+             handle_type: WaitHandleType::Session,
+             mitm_forward_info: ObjectInfo::new(),
++            deferred: None,
+             is_mitm_service: false,
+             service_name: sm::ServiceName::empty(),
+             domain_table: None,
+@@ -381,6 +418,7 @@ impl ServerHolder {
+             new_mitm_server_fn: None,
+             handle_type: WaitHandleType::Session,
+             mitm_forward_info: ObjectInfo::new(),
++            deferred: None,
+             is_mitm_service: false,
+             service_name: sm::ServiceName::empty(),
+             domain_table: None,
+@@ -398,6 +436,7 @@ impl ServerHolder {
+             new_mitm_server_fn: None,
+             handle_type: WaitHandleType::Server,
+             mitm_forward_info: ObjectInfo::new(),
++            deferred: None,
+             is_mitm_service: false,
+             service_name,
+             domain_table: None,
+@@ -415,6 +454,7 @@ impl ServerHolder {
+             new_mitm_server_fn: Some(create_mitm_server_object_impl::<S>),
+             handle_type: WaitHandleType::Server,
+             mitm_forward_info: ObjectInfo::new(),
++            deferred: None,
+             is_mitm_service: true,
+             service_name,
+             domain_table: None,
+@@ -430,6 +470,7 @@ impl ServerHolder {
+             new_mitm_server_fn: self.new_mitm_server_fn,
+             handle_type: WaitHandleType::Session,
+             mitm_forward_info: ObjectInfo::new(),
++            deferred: None,
+             is_mitm_service: self.is_mitm_service,
+             service_name: sm::ServiceName::empty(),
+             domain_table: None,
+@@ -451,6 +492,7 @@ impl ServerHolder {
+             new_mitm_server_fn: self.new_mitm_server_fn,
+             handle_type: WaitHandleType::Session,
+             mitm_forward_info: ObjectInfo::from_handle(forward_handle),
++            deferred: None,
+             is_mitm_service: self.is_mitm_service,
+             service_name,
+             domain_table: None,
+@@ -469,6 +511,7 @@ impl ServerHolder {
+             new_mitm_server_fn: self.new_mitm_server_fn,
+             handle_type: WaitHandleType::Session,
+             mitm_forward_info: mitm_fwd_info,
++            deferred: None,
+             is_mitm_service: forward_handle != svc::INVALID_HANDLE,
+             service_name: sm::ServiceName::empty(),
+             domain_table: self.domain_table.clone(),
+@@ -712,16 +755,25 @@ impl<const P: usize> ServerManager<P> {
+     }
+ 
+     #[inline(always)]
+-    fn prepare_wait_handles(&mut self) -> &[svc::Handle] {
+-        let mut handles_index: usize = 0;
+-        for server_holder in &mut self.server_holders {
+-            let server_info = server_holder.info;
+-            if server_info.handle != svc::INVALID_HANDLE {
+-                self.wait_handles[handles_index] = server_info.handle;
+-                handles_index += 1;
++    fn prepare_wait_handles(&mut self) -> usize {
++        // ponytail: past MAX_COUNT handles the extras are silently not waited on; callers
++        // cap their session counts so sessions + deferral handles stay under it.
++        let mut count: usize = 0;
++        let mut push = |handle: svc::Handle, handles: &mut [svc::Handle; MAX_COUNT]| {
++            if handle != svc::INVALID_HANDLE && count < MAX_COUNT && !handles[..count].contains(&handle) {
++                handles[count] = handle;
++                count += 1;
++            }
++        };
++        for server_holder in &self.server_holders {
++            push(server_holder.info.handle, &mut self.wait_handles);
++        }
++        for server_holder in &self.server_holders {
++            if let Some(deferred) = &server_holder.deferred {
++                push(deferred.deferral.wait_handle, &mut self.wait_handles);
+             }
+         }
+-        &self.wait_handles[..handles_index]
++        count
+     }
+ 
+     #[inline(always)]
+@@ -733,10 +785,12 @@ impl<const P: usize> ServerManager<P> {
+         domain_command_type: cmif::DomainCommandType,
+         ipc_buf_backup: &[u8],
+         domain_table: Option<Rc<Mutex<DomainTable>>>,
+-    ) -> Result<()> {
++        resumed: bool,
++    ) -> Result<Option<Deferral>> {
+         let is_domain = ctx.object_info.is_domain();
+         let domain_table_clone = domain_table.clone();
+         let pointer_buffer = self.pointer_buffer.as_mut_ptr();
++        let mut deferral = None;
+         let do_handle_request = || -> Result<()> {
+             let mut new_sessions: Vec<ServerHolder> = Vec::new();
+             for server_holder in &mut self.server_holders {
+@@ -782,11 +836,16 @@ impl<const P: usize> ServerManager<P> {
+                             server_ctx.mitm_forward = server_holder.mitm_forward_info;
+                             server_ctx.mitm_forward.owns_handle = false;
+                         }
+-                        if let Some(result) = target_server.lock().try_handle_request_by_id(
++                        server_ctx.resumed = resumed;
++                        let result = target_server.lock().try_handle_request_by_id(
+                             rq_id,
+                             protocol,
+                             &mut server_ctx,
+-                        ) {
++                        );
++                        if let Some(Ok(())) = result {
++                            deferral = server_ctx.defer.take();
++                        }
++                        if let Some(result) = result {
+                             command_found = true;
+                             if let Err(rc) = result {
+                                 if server_holder.is_mitm_service
+@@ -856,7 +915,7 @@ impl<const P: usize> ServerManager<P> {
+             }
+         }
+ 
+-        Ok(())
++        Ok(deferral)
+     }
+ 
+     #[inline(always)]
+@@ -921,10 +980,13 @@ impl<const P: usize> ServerManager<P> {
+         Ok(())
+     }
+ 
+-    fn process_signaled_handle(&mut self, handle: svc::Handle) -> Result<()> {
++    /// Serves `handle`. With `resume`, re-dispatches the request deferred on that session
++    /// instead of receiving a new one.
++    fn process_signaled_handle(&mut self, handle: svc::Handle, resume: bool) -> Result<()> {
+         let mut server_found = false;
+         let mut index: usize = 0;
+         let mut should_close_session = false;
++        let mut should_dispatch = false;
+         let mut new_sessions: Vec<ServerHolder> = Vec::new();
+ 
+         let mut ctx = CommandContext::empty();
+@@ -939,6 +1001,24 @@ impl<const P: usize> ServerManager<P> {
+             if server_info.handle == handle {
+                 server_found = true;
+                 match server_holder.handle_type {
++                    WaitHandleType::Session if resume => {
++                        let deferred = server_holder
++                            .deferred
++                            .take()
++                            .ok_or(rc::ResultSignaledServerNotFound::make())?;
++                        unsafe {
++                            core::ptr::copy(deferred.msg.as_ptr(), get_msg_buffer(), deferred.msg.len())
++                        };
++                        self.pointer_buffer[..deferred.pointer_data.len()]
++                            .copy_from_slice(&deferred.pointer_data);
++                        should_dispatch = true;
++                    }
++                    WaitHandleType::Session if server_holder.deferred.is_some() => {
++                        // A session holding an unanswered request only signals once its client
++                        // has closed.
++                        should_close_session = true;
++                        break;
++                    }
+                     WaitHandleType::Session => {
+                         if P > 0 {
+                             // Send our pointer buffer as a C descriptor for kernel - why are Pointer buffers so fucking weird?
+@@ -962,49 +1042,55 @@ impl<const P: usize> ServerManager<P> {
+                                 return Err(rc);
+                             }
+                         };
++                        should_dispatch = true;
++                    }
++                    _ => {}
++                }
++                if should_dispatch {
++                    unsafe {
++                        core::ptr::copy(
++                            get_msg_buffer(),
++                            ipc_buf_backup.as_mut_ptr(),
++                            ipc_buf_backup.len(),
++                        )
++                    };
+ 
+-                        unsafe {
+-                            core::ptr::copy(
+-                                get_msg_buffer(),
+-                                ipc_buf_backup.as_mut_ptr(),
+-                                ipc_buf_backup.len(),
+-                            )
+-                        };
+-
+-                        ctx = CommandContext::new_server(
+-                            server_info,
+-                            self.pointer_buffer.as_mut_ptr(),
+-                            P,
+-                        );
+-                        command_type = cmif::server::read_command_from_msg_buffer(&mut ctx);
+-                        match command_type {
+-                            cmif::CommandType::Request | cmif::CommandType::RequestWithContext => {
+-                                match cmif::server::read_request_command_from_msg_buffer(&mut ctx) {
+-                                    Ok((request_id, domain_command_type, domain_object_id)) => {
+-                                        let mut base_info = server_info;
+-                                        if server_info.is_domain() {
+-                                            // This is a domain request
+-                                            base_info.domain_object_id = domain_object_id;
+-                                            base_info.owns_handle =
+-                                                server_info.domain_object_id == domain_object_id;
+-                                        }
+-                                        ctx.object_info = base_info;
+-                                        domain_cmd_type = domain_command_type;
+-                                        rq_id = request_id;
+-                                        domain_table = server_holder.domain_table.clone();
++                    ctx = CommandContext::new_server(
++                        server_info,
++                        self.pointer_buffer.as_mut_ptr(),
++                        P,
++                    );
++                    command_type = cmif::server::read_command_from_msg_buffer(&mut ctx);
++                    match command_type {
++                        cmif::CommandType::Request | cmif::CommandType::RequestWithContext => {
++                            match cmif::server::read_request_command_from_msg_buffer(&mut ctx) {
++                                Ok((request_id, domain_command_type, domain_object_id)) => {
++                                    let mut base_info = server_info;
++                                    if server_info.is_domain() {
++                                        // This is a domain request
++                                        base_info.domain_object_id = domain_object_id;
++                                        base_info.owns_handle =
++                                            server_info.domain_object_id == domain_object_id;
+                                     }
+-                                    Err(rc) => return Err(rc),
+-                                };
+-                            }
+-                            cmif::CommandType::Control | cmif::CommandType::ControlWithContext => {
+-                                rq_id = cmif::server::read_control_command_from_msg_buffer(&mut ctx)? as u32;
+-                            }
+-                            cmif::CommandType::Close => {
+-                                should_close_session = true;
+-                            }
+-                            _ => return rc::ResultInvalidCommandType::make_err(),
++                                    ctx.object_info = base_info;
++                                    domain_cmd_type = domain_command_type;
++                                    rq_id = request_id;
++                                    domain_table = server_holder.domain_table.clone();
++                                }
++                                Err(rc) => return Err(rc),
++                            };
++                        }
++                        cmif::CommandType::Control | cmif::CommandType::ControlWithContext => {
++                            rq_id = cmif::server::read_control_command_from_msg_buffer(&mut ctx)? as u32;
+                         }
++                        cmif::CommandType::Close => {
++                            should_close_session = true;
++                        }
++                        _ => return rc::ResultInvalidCommandType::make_err(),
+                     }
++                }
++                match server_holder.handle_type {
++                    WaitHandleType::Session => {}
+                     WaitHandleType::Server => {
+                         let new_handle = svc::accept_session(handle)?;
+ 
+@@ -1051,15 +1137,30 @@ impl<const P: usize> ServerManager<P> {
+ 
+         match command_type {
+             cmif::CommandType::Request | cmif::CommandType::RequestWithContext => {
+-                self.handle_request_command(
++                let deferral = self.handle_request_command(
+                     &mut ctx,
+                     rq_id,
+                     command_type,
+                     domain_cmd_type,
+                     &ipc_buf_backup,
+                     domain_table,
++                    resume,
+                 )?;
+-                reply_impl()?;
++                match deferral {
++                    Some(deferral) => {
++                        let pointer_data = self.pointer_buffer.to_vec();
++                        if let Some(holder) =
++                            self.server_holders.iter_mut().find(|h| h.info.handle == handle)
++                        {
++                            holder.deferred = Some(DeferredRequest {
++                                deferral,
++                                msg: ipc_buf_backup,
++                                pointer_data,
++                            });
++                        }
++                    }
++                    None => reply_impl()?,
++                }
+             }
+             cmif::CommandType::Control | cmif::CommandType::ControlWithContext => {
+                 self.handle_control_command(&mut ctx, rq_id, command_type)?;
+@@ -1076,6 +1177,9 @@ impl<const P: usize> ServerManager<P> {
+         };
+ 
+         if should_close_session {
++            if let Some(server) = self.server_holders[index].server.clone() {
++                server.lock().on_session_closed(handle);
++            }
+             self.server_holders.remove(index);
+         }
+ 
+@@ -1152,12 +1256,57 @@ impl<const P: usize> ServerManager<P> {
+     }
+ 
+     pub fn process(&mut self) -> Result<()> {
+-        let handles = self.prepare_wait_handles();
+-        let index = wait::wait_handles(handles, 100_000)?;
++        let earliest = self
++            .server_holders
++            .iter()
++            .filter_map(|holder| holder.deferred.as_ref())
++            .map(|deferred| deferred.deferral.deadline)
++            .min()
++            .unwrap_or(u64::MAX);
++        let timeout = match earliest {
++            u64::MAX => -1,
++            deadline => {
++                // Clamp so the tick->ns conversion can't overflow (~30 minutes).
++                let ticks = deadline.saturating_sub(arm::get_system_tick()).min(1 << 35);
++                arm::ticks_to_nanoseconds(ticks) as i64
++            }
++        };
+ 
+-        let signaled_handle = self.wait_handles[index];
+-        self.process_signaled_handle(signaled_handle)?;
++        let count = self.prepare_wait_handles();
++        match wait::wait_handles(&self.wait_handles[..count], timeout) {
++            Ok(index) => {
++                let signaled_handle = self.wait_handles[index];
++                if self
++                    .server_holders
++                    .iter()
++                    .any(|holder| holder.info.handle == signaled_handle)
++                {
++                    self.process_signaled_handle(signaled_handle, false)
++                } else {
++                    // Clear before re-dispatching: a handler that re-checks and re-defers can then
++                    // never sleep through a signal raised after its check.
++                    let _ = svc::reset_signal(signaled_handle);
++                    self.resume_deferred(|deferral| deferral.wait_handle == signaled_handle)
++                }
++            }
++            Err(rc) if svc::rc::ResultTimedOut::matches(rc) && earliest != u64::MAX => {
++                let now = arm::get_system_tick();
++                self.resume_deferred(|deferral| deferral.deadline <= now)
++            }
++            Err(rc) => Err(rc),
++        }
++    }
+ 
++    fn resume_deferred(&mut self, due: impl Fn(&Deferral) -> bool) -> Result<()> {
++        let handles: Vec<svc::Handle> = self
++            .server_holders
++            .iter()
++            .filter(|holder| holder.deferred.as_ref().is_some_and(|d| due(&d.deferral)))
++            .map(|holder| holder.info.handle)
++            .collect();
++        for handle in handles {
++            self.process_signaled_handle(handle, true)?;
++        }
+         Ok(())
+     }
+ 
+-- 
+2.34.1
+

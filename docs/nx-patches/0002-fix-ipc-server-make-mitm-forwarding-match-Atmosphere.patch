@@ -1,0 +1,156 @@
+From a8ccbd0f209f462b48f59994dd71cb7377b4c55f Mon Sep 17 00:00:00 2001
+From: Ryan Circelli <ryancircelli@gmail.com>
+Date: Sun, 25 Oct 2026 13:06:32 -0400
+Subject: [PATCH 2/3] fix(ipc/server): make mitm forwarding match Atmosphere
+
+Forwarded requests now tag the client process id with 0xFFFE (so the real
+service sees a mitm'd pid, as ProcessMessageForMitmImpl does) and rewrite
+the receive list to a single buffer in our pointer buffer, so out
+AutoSelect/pointer replies from the real service land somewhere valid.
+QueryPointerBufferSize on a mitm session is capped by the real service's.
+ServerContext exposes the (borrowed) forward session to handlers.
+
+Known gaps: copy handles in forwarded replies are not closed; reply X
+descriptors are passed through as the kernel wrote them.
+
+Signed-off-by: Ryan Circelli <ryancircelli@gmail.com>
+---
+ src/ipc/cmif/server.rs | 56 ++++++++++++++++++++++++++++++++++++++++++
+ src/ipc/server.rs      | 22 ++++++++++++++++-
+ 2 files changed, 77 insertions(+), 1 deletion(-)
+
+diff --git a/src/ipc/cmif/server.rs b/src/ipc/cmif/server.rs
+index bf7a00d..c9358de 100755
+--- a/src/ipc/cmif/server.rs
++++ b/src/ipc/cmif/server.rs
+@@ -273,3 +273,59 @@ pub fn write_control_command_response_on_msg_buffer(
+ pub fn write_close_command_response_on_msg_buffer(ctx: &mut CommandContext) {
+     write_command_response_on_msg_buffer(ctx, CommandType::Close, 0);
+ }
++
++/// Prepares the request just received into the message buffer at `msg` to be sent unchanged to
++/// the real service behind a MitM session, as Atmosphere's `PreProcessCommandBufferForMitm`:
++///
++/// - a sent process id gets the `0xFFFE` tag, so the kernel passes the client's process id
++///   through instead of replacing it with ours;
++/// - the receive list names buffers in the client's address space, so it is replaced by a single
++///   entry covering `recv_buffer`: the real service's out-pointer data lands there, and replying
++///   with the real service's response copies it on to the client.
++///
++/// # Safety
++///
++/// `msg` must point to a received request message (0x100 bytes, e.g. the TLS message buffer) and
++/// `recv_buffer` to `recv_buffer_size` writable bytes that stay valid until the real service replies.
++pub unsafe fn prepare_mitm_forward(msg: *mut u8, recv_buffer: *mut u8, recv_buffer_size: usize) {
++    const MSG_WORDS: usize = 0x100 / cmem::size_of::<u32>();
++    const MITM_PROCESS_ID_TAG: u64 = 0xFFFE_0000_0000_0000;
++    unsafe {
++        let words = msg as *mut u32;
++        let header = *(msg as *const CommandHeader);
++        let mut offset = 2;
++        if header.get_has_special_header() {
++            let special = *(words.add(offset) as *const CommandSpecialHeader);
++            offset += 1;
++            if special.get_send_process_id() {
++                let process_id = words.add(offset) as *mut u64;
++                let client = process_id.read_unaligned() & !MITM_PROCESS_ID_TAG;
++                process_id.write_unaligned(MITM_PROCESS_ID_TAG | client);
++                offset += 2;
++            }
++            offset += (special.get_copy_handle_count() + special.get_move_handle_count()) as usize;
++        }
++        offset += 2 * header.get_send_static_count() as usize
++            + 3 * (header.get_send_buffer_count()
++                + header.get_receive_buffer_count()
++                + header.get_exchange_buffer_count()) as usize
++            + header.get_data_word_count() as usize;
++
++        let header_word_2 = *words.add(1);
++        let receive_static_mode = (header_word_2 >> 10) & 0xF;
++        let receive_list_offset = ((header_word_2 >> 20) & 0x7FF) as usize;
++        if receive_static_mode != 0 {
++            let list = if receive_list_offset != 0 {
++                receive_list_offset
++            } else {
++                offset
++            };
++            if list + 2 <= MSG_WORDS {
++                // Mode 2: one receive buffer for every X descriptor of the reply.
++                *words.add(1) = (header_word_2 & !(0xF << 10)) | (2 << 10);
++                let entry = ReceiveStaticDescriptor::new(recv_buffer, recv_buffer_size.min(0xFFFF));
++                (words.add(list) as *mut ReceiveStaticDescriptor).write_unaligned(entry);
++            }
++        }
++    }
++}
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index 8f74bf5..404cc97 100755
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -29,6 +29,10 @@ pub struct ServerContext<'ctx> {
+     pub raw_data_walker: DataWalker,
+     pub domain_table: Option<Rc<Mutex<DomainTable>>>,
+     pub new_sessions: &'ctx mut Vec<ServerHolder>,
++    /// For a MitM session: the session to the real service this request's session forwards to
++    /// (from `AtmosphereAcknowledgeMitmSession`, or its clone). Borrowed: the server closes it.
++    /// Empty (handle 0) otherwise.
++    pub mitm_forward: ObjectInfo,
+ }
+ 
+ impl<'ctx> ServerContext<'ctx> {
+@@ -43,6 +47,7 @@ impl<'ctx> ServerContext<'ctx> {
+             raw_data_walker,
+             domain_table,
+             new_sessions,
++            mitm_forward: ObjectInfo::new(),
+         }
+     }
+ }
+@@ -605,7 +610,16 @@ impl IHipcManager for HipcManager<'_> {
+     }
+ 
+     fn query_pointer_buffer_size(&mut self) -> Result<u16> {
+-        Ok(self.pointer_buf_size as u16)
++        let size = self.pointer_buf_size as u16;
++        if self.server_holder.is_mitm_service {
++            // Forwarded X data must fit the real service's pointer buffer too.
++            let real = self
++                .server_holder
++                .mitm_forward_info
++                .query_pointer_buffer_size()?;
++            return Ok(size.min(real));
++        }
++        Ok(size)
+     }
+ 
+     fn clone_current_object_ex(&mut self, _tag: u32) -> Result<sf::MoveHandle> {
+@@ -722,6 +736,7 @@ impl<const P: usize> ServerManager<P> {
+     ) -> Result<()> {
+         let is_domain = ctx.object_info.is_domain();
+         let domain_table_clone = domain_table.clone();
++        let pointer_buffer = self.pointer_buffer.as_mut_ptr();
+         let do_handle_request = || -> Result<()> {
+             let mut new_sessions: Vec<ServerHolder> = Vec::new();
+             for server_holder in &mut self.server_holders {
+@@ -731,6 +746,7 @@ impl<const P: usize> ServerManager<P> {
+                         let ipc_buf = get_msg_buffer();
+                         unsafe {
+                             core::ptr::copy(ipc_buf_backup.as_ptr(), ipc_buf, ipc_buf_backup.len());
++                            cmif::server::prepare_mitm_forward(ipc_buf, pointer_buffer, P);
+                         }
+                         // Let the original service take care of the command for us.
+                         svc::send_sync_request(server_holder.mitm_forward_info.handle)
+@@ -762,6 +778,10 @@ impl<const P: usize> ServerManager<P> {
+                             domain_table_clone.clone(),
+                             &mut new_sessions,
+                         );
++                        if server_holder.is_mitm_service {
++                            server_ctx.mitm_forward = server_holder.mitm_forward_info;
++                            server_ctx.mitm_forward.owns_handle = false;
++                        }
+                         if let Some(result) = target_server.lock().try_handle_request_by_id(
+                             rq_id,
+                             protocol,
+-- 
+2.34.1
+

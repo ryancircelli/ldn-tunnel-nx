@@ -1,0 +1,74 @@
+From 94ae58bd5bbfa4959444892a1548616502f4665a Mon Sep 17 00:00:00 2001
+From: Ryan Circelli <ryancircelli@gmail.com>
+Date: Mon, 26 Oct 2026 10:40:47 -0400
+Subject: [PATCH] fix(nx/ipc): read the process id unaligned
+
+The process id follows the special header at word 3, so it is only
+4-aligned; nx read it with a plain u64 dereference. That is undefined
+behaviour (debug builds abort on it, found by the host IPC tests); the
+console tolerates the unaligned load, and the release ELF is
+byte-identical with read_unaligned.
+
+Signed-off-by: Ryan Circelli <ryancircelli@gmail.com>
+---
+ src/ipc/cmif/client.rs | 2 +-
+ src/ipc/cmif/server.rs | 2 +-
+ src/ipc/tipc/client.rs | 2 +-
+ src/ipc/tipc/server.rs | 2 +-
+ 4 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/ipc/cmif/client.rs b/src/ipc/cmif/client.rs
+index 759fdf6..90ae98b 100755
+--- a/src/ipc/cmif/client.rs
++++ b/src/ipc/cmif/client.rs
+@@ -90,7 +90,7 @@ pub fn read_command_response_from_msg_buffer(ctx: &mut CommandContext) {
+             move_handle_count = (*special_header).get_move_handle_count();
+             ipc_buf = special_header.offset(1) as *mut u8;
+             if (*special_header).get_send_process_id() {
+-                ctx.out_params.process_id = *(ipc_buf as *mut u64);
++                ctx.out_params.process_id = (ipc_buf as *mut u64).read_unaligned(); // at word 3: 4-aligned
+                 ipc_buf = ipc_buf.add(cmem::size_of::<u64>());
+             }
+         }
+diff --git a/src/ipc/cmif/server.rs b/src/ipc/cmif/server.rs
+index c9358de..0862cf4 100755
+--- a/src/ipc/cmif/server.rs
++++ b/src/ipc/cmif/server.rs
+@@ -20,7 +20,7 @@ pub fn read_command_from_msg_buffer(ctx: &mut CommandContext) -> CommandType {
+             ctx.in_params.send_process_id = (*special_header).get_send_process_id();
+             if ctx.in_params.send_process_id {
+                 let process_id_ptr = ipc_buf as *mut u64;
+-                ctx.in_params.process_id = *process_id_ptr;
++                ctx.in_params.process_id = process_id_ptr.read_unaligned(); // at word 3: 4-aligned
+                 ipc_buf = process_id_ptr.offset(1) as *mut u8;
+             }
+ 
+diff --git a/src/ipc/tipc/client.rs b/src/ipc/tipc/client.rs
+index 00e5e55..1b87bbb 100755
+--- a/src/ipc/tipc/client.rs
++++ b/src/ipc/tipc/client.rs
+@@ -80,7 +80,7 @@ pub fn read_command_response_from_msg_buffer(ctx: &mut CommandContext) {
+             move_handle_count = (*special_header).get_move_handle_count();
+             ipc_buf = special_header.offset(1) as *mut u8;
+             if (*special_header).get_send_process_id() {
+-                ctx.out_params.process_id = *(ipc_buf as *mut u64);
++                ctx.out_params.process_id = (ipc_buf as *mut u64).read_unaligned(); // at word 3: 4-aligned
+                 ipc_buf = ipc_buf.add(cmem::size_of::<u64>());
+             }
+         }
+diff --git a/src/ipc/tipc/server.rs b/src/ipc/tipc/server.rs
+index d0db03f..3cf669d 100755
+--- a/src/ipc/tipc/server.rs
++++ b/src/ipc/tipc/server.rs
+@@ -20,7 +20,7 @@ pub fn read_command_from_msg_buffer(ctx: &mut CommandContext) -> u32 {
+             ctx.in_params.send_process_id = (*special_header).get_send_process_id();
+             if ctx.in_params.send_process_id {
+                 let process_id_ptr = ipc_buf as *mut u64;
+-                ctx.in_params.process_id = *process_id_ptr;
++                ctx.in_params.process_id = process_id_ptr.read_unaligned(); // at word 3: 4-aligned
+                 ipc_buf = process_id_ptr.offset(1) as *mut u8;
+             }
+ 
+-- 
+2.34.1
+

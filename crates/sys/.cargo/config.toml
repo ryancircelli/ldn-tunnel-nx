@@ -1,0 +1,10 @@
+# Scoped to crates/sys so host `cargo test` at the repo root is unaffected.
+# The target is built into rustc (tier 3): it ships its own linker script and
+# links with rust-lld, so no external linker or .ld file is needed.
+[build]
+target = "aarch64-nintendo-switch-freestanding"
+
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+# Our own memcpy/memset/...: there is no libc to provide them.
+build-std-features = ["compiler-builtins-mem"]

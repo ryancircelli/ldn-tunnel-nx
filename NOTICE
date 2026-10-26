@@ -1,0 +1,37 @@
+ldn-tunnel
+Copyright (c) 2026 ldn-tunnel contributors
+
+Everything outside relay/ is licensed under GPL-2.0-or-later (see LICENSE).
+relay/ is MIT (see relay/LICENSE). Details and reasoning: docs/LICENSING.md.
+
+This project is derived from, or links, the following works.
+
+ryu_ldn_nx (GPL-2.0-or-later source headers; LICENSE file is GPLv2 text)
+  Copyright (c) 2026 ryu_ldn_nx contributors
+  The Rust sysmodule and the overlay are ports of this C++ project.
+
+ryu_ldn (MIT)
+  Parts of ryu_ldn_nx (e.g. the packet buffer) were ported from ryu_ldn.
+
+ldn_mitm (GPLv2) -- https://github.com/spacemeowx2/ldn_mitm
+  Original Switch LDN MITM sysmodule. Its design (the ldn:u interception,
+  command layout, state-error behaviour) is the model for ours.
+
+Ryujinx LdnServer and LDN client (MIT)
+  Copyright (c) Ryujinx Team and Contributors
+  The wire protocol and the relay's server logic follow Ryujinx's LdnServer.
+  The MIT permission notice and this copyright line must stay with relay/.
+
+libnx (ISC), Copyright (c) libnx Authors
+nx crate (MIT), Copyright (c) 2020 XorTroll
+Atmosphere-libs (GPLv2), Atmosphere-NX
+libultrahand (GPLv2; libultra part CC-BY-4.0), Copyright (c) 2023-2026 ppkantorski
+libtesla (GPLv2), WerWolv
+  Used by the overlay (libultrahand, libtesla, libnx) and the sysmodule (nx).
+
+Rust crates (see docs/LICENSING.md for the checked licences):
+  zerocopy (BSD-2-Clause OR Apache-2.0 OR MIT), heapless (MIT OR Apache-2.0),
+  p256 (Apache-2.0 OR MIT), sha2 (MIT OR Apache-2.0),
+  embedded-tls (Apache-2.0), rustls (Apache-2.0 OR ISC OR MIT),
+  rustls-webpki (ISC).
+Relay/web tooling: fflate (MIT), Copyright (c) 2026 Arjun Barrett.

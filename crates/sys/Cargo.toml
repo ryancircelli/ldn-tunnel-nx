@@ -1,0 +1,66 @@
+[package]
+name = "ldn-tunnel-sys"
+description = "Horizon shell of ldn-tunnel: the Atmosphere sysmodule built on the nx crate"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+publish = false
+
+# Built on its own (excluded from the root workspace): it needs nightly,
+# -Zbuild-std and the aarch64-nintendo-switch-freestanding target. See README.md.
+[workspace]
+
+[[bin]]
+name = "ldn-tunnel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+ldn-tunnel-core = { path = "../core" }
+# Same versions core already pulls in (heapless and zerocopy directly, sha2 through p256).
+heapless = { version = "0.9.3", default-features = false }
+sha2 = { version = "0.11.1", default-features = false }
+zerocopy = "0.8"
+# Vendored nx at rev 5e0a67c630352c93414b421a77ed2de587f61393 plus docs/nx-patches/*.patch.
+nx = { path = "../../vendor/nx", features = ["fs"] }
+ldn-tunnel-tls = { path = "../tls" }
+embedded-io = { version = "0.7", default-features = false }
+# Same backend crates/tls turns on for Horizon; net/getrandom.rs registers csrng.
+getrandom = { version = "0.2", default-features = false, features = ["custom"] }
+# Only to name certificate-time errors; same version and features crates/tls uses.
+rustls = { version = "0.23.46", default-features = false, features = ["tls12"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+# unwinding 0.2.10 (latest release, pulled in by nx) calls core::intrinsics::abort,
+# which current nightly removed. Upstream fixed it in this unreleased commit;
+# drop the patch once a release > 0.2.10 is out.
+[patch.crates-io]
+unwinding = { git = "https://github.com/nbdd0121/unwinding", rev = "afb810fb2d65eb69b5e31d59386e68fb2b12d9f3" }
+
+# cargo-nx packaging: `make nsp` renders main.json (ident.rs values) to this path first.
+[package.metadata.nx.nsp]
+npdm_json = "target/nsp/main.json"
+
+# Own [workspace], so it cannot inherit [workspace.lints]; keep in sync with the root Cargo.toml.
+# unsafe_code is "deny" (not forbid): rt.rs, bsd/service.rs and server/forward.rs opt in with a reason.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+indexing_slicing = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+arithmetic_side_effects = "warn"

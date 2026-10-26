@@ -1,0 +1,12 @@
+# Public domain: Caddy gets and renews a Let's Encrypt certificate by itself (ports 80 and 443 must reach it).
+# LAN only / no public DNS: write `tls internal` inside the block. Caddy then signs with its own private CA;
+# install that root on the consoles by appending it to the ca.pem of the console kit, since the consoles verify the
+# relay's certificate. Get it with: docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt .
+# Let's Encrypt only: the consoles' ca.pem holds its root (ISRG Root X1), not ZeroSSL's.
+{
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+}
+
+{$RELAY_DOMAIN} {
+	reverse_proxy relay:8080
+}

@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/core"]
+# crates/sys (the Horizon shell) is built separately with the nightly
+# aarch64-nintendo-switch-freestanding target; see crates/sys/README.md.
+exclude = ["crates/sys", "crates/tls", "relay", "overlay"]
+default-members = ["crates/core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# Parsers run on untrusted bytes: no panics, no indexing. Tests may #[allow].
+indexing_slicing = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+arithmetic_side_effects = "warn"

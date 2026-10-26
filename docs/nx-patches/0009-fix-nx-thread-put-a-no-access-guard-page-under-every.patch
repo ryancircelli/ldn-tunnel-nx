@@ -1,0 +1,73 @@
+From 41db88e6592561c413f262c37734622c7c07826b Mon Sep 17 00:00:00 2001
+From: Ryan Circelli <ryancircelli@gmail.com>
+Date: Mon, 26 Oct 2026 09:21:21 -0400
+Subject: [PATCH] fix(nx/thread): put a no-access guard page under every thread
+ stack
+
+Builder stacks come from the global heap, so an overflow silently ran
+into whatever the allocator put below: on hardware a 32 KB frame on the
+32 KiB bsd:u stack overwrote the ldn:u thread's stack, which crashed
+much later with a report pointing at the wrong thread.
+
+Allocate one extra page and make the lowest one no-access with
+svcSetMemoryPermission. The target uses inline stack probes, which
+touch every page of a large frame in order, so any overflow now faults
+on the guard page in the thread that overflowed (libnx gets the same
+from the unmapped space around stacks it maps into the stack region).
+Heap and .bss pages (Normal/CodeData) allow the reprotect. The page goes
+back to read-write before the error path frees it; a started thread's
+stack is never freed (stack_top stays null, so Drop skips it).
+
+Signed-off-by: Ryan Circelli <ryancircelli@gmail.com>
+---
+ src/thread.rs | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/src/thread.rs b/src/thread.rs
+index 3fae020..73241f6 100755
+--- a/src/thread.rs
++++ b/src/thread.rs
+@@ -1279,13 +1279,25 @@ pub mod imp {
+             priority: ThreadPriority,
+             core: ThreadStartCore,
+         ) -> crate::result::Result<svc::Handle> {
+-            // stack sized up to be a multiple of a page
+-            let aligned_stack_size = align_up!(stack_size, PAGE_ALIGNMENT);
++            // stack sized up to be a multiple of a page, plus one guard page below it
++            let aligned_stack_size = align_up!(stack_size, PAGE_ALIGNMENT) + PAGE_ALIGNMENT;
+             // layout for stack allocation, we know it's safe because the page alignment constant is a valid alignment
+             let stack_layout =
+                 unsafe { Layout::from_size_align_unchecked(aligned_stack_size, PAGE_ALIGNMENT) };
+             // now we can request memory for the stack
+             let stack: *mut u8 = Global.allocate(stack_layout).unwrap().as_ptr().cast();
++            // The stack comes from the heap, so whatever sits below it would silently take an
++            // overflow. Make its lowest page no-access instead: the target's inline stack probes
++            // touch every page of a large frame in order, so any overflow faults on this page
++            // (libnx gets the same from unmapped space around stacks it maps into the stack region).
++            // The page is never handed back to the allocator while no-access (see the error path;
++            // a started thread's stack is never freed: `stack_top` stays null, so Drop skips it).
++            if let Err(e) = unsafe {
++                svc::set_memory_permission(stack, PAGE_ALIGNMENT, svc::MemoryPermission::None())
++            } {
++                unsafe { Global.deallocate(NonNull::new_unchecked(stack), stack_layout) };
++                return Err(e);
++            }
+             // this is technically out of bounds, but the stack top should point to the byte *AFTER* the end of the stack not the last byte of the stack.
+             let stack_top = unsafe { stack.add(aligned_stack_size) };
+ 
+@@ -1309,6 +1321,12 @@ pub mod imp {
+                         let _reclaimed_thread_args =
+                             Box::from_raw(entry_args_raw as *mut ThreadArgs);
+ 
++                        // the allocator writes its free-list header into the guard page
++                        let _ = svc::set_memory_permission(
++                            stack,
++                            PAGE_ALIGNMENT,
++                            svc::MemoryPermission::Read() | svc::MemoryPermission::Write(),
++                        );
+                         Global.deallocate(NonNull::new_unchecked(stack), stack_layout);
+                     }
+                     return Err(e);
+-- 
+2.34.1
+

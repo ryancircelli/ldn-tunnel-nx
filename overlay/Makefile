@@ -1,0 +1,244 @@
+#---------------------------------------------------------------------------------
+# ldn-tunnel Tesla Overlay Makefile
+# Using libultrahand (extended libtesla with libultra)
+#---------------------------------------------------------------------------------
+.SUFFIXES:
+#---------------------------------------------------------------------------------
+
+ifeq ($(strip $(DEVKITPRO)),)
+$(error "Please set DEVKITPRO in your environment. export DEVKITPRO=<path to>/devkitpro")
+endif
+
+TOPDIR ?= $(CURDIR)
+include $(DEVKITPRO)/libnx/switch_rules
+
+#---------------------------------------------------------------------------------
+# TARGET is the name of the output
+# BUILD is the directory where object files & intermediate files will be placed
+# SOURCES is a list of directories containing source code
+# DATA is a list of directories containing data files
+# INCLUDES is a list of directories containing header files
+#---------------------------------------------------------------------------------
+# The one place the overlay name lives. Keep in sync with crates/core/src/ident.rs
+# (NAME, OVERLAY_PATH = sdmc:/switch/.overlays/ldn-tunnel.ovl, CFG_SERVICE = ldnt:cfg;
+# the service name itself is in source/ldn_tunnel_ipc.c).
+NAME        := ldn-tunnel
+TARGET_VERSION := 0.1.0
+VERSION_DEFINES := -DLDNT_VERSION="\"${TARGET_VERSION}\""
+
+APP_TITLE   := $(NAME)
+APP_VERSION := $(TARGET_VERSION)
+
+TARGET      := $(NAME)
+BUILD       := build
+SOURCES     := source
+DATA        := data
+INCLUDES    := include \
+               source
+
+NO_ICON     := 1
+
+#---------------------------------------------------------------------------------
+# libultrahand - Extended Tesla Menu Overlay Framework
+# Includes libtesla + libultra with additional features
+#---------------------------------------------------------------------------------
+# Include libultrahand sources and headers
+SOURCES  += libultrahand/common \
+            libultrahand/libultra/source \
+            libultrahand/libtesla/source
+INCLUDES += libultrahand/common \
+            libultrahand/libultra/include \
+            libultrahand/libtesla/include
+
+#---------------------------------------------------------------------------------
+# Logging support (optional)
+# Enable with: make LOGGING=1
+#---------------------------------------------------------------------------------
+ifeq ($(LOGGING),1)
+CFLAGS += -DUSING_LOGGING_DIRECTIVE=1
+endif
+
+#---------------------------------------------------------------------------------
+# options for code generation
+#---------------------------------------------------------------------------------
+ARCH    := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
+
+#---------------------------------------------------------------------------------
+# Debug build support
+# Usage: make DEBUG=1
+#---------------------------------------------------------------------------------
+ifeq ($(DEBUG),1)
+OPTFLAGS := -Og -DDEBUG
+else
+OPTFLAGS := -O2
+endif
+
+CFLAGS  := -g -Wall $(OPTFLAGS) -ffunction-sections \
+           $(ARCH) $(DEFINES) $(VERSION_DEFINES)
+
+CFLAGS  += $(INCLUDE) -D__SWITCH__
+
+CXXFLAGS := $(CFLAGS) -fno-exceptions -std=c++20
+
+ASFLAGS := -g $(ARCH)
+LDFLAGS = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
+
+LIBS    := -lnx
+
+#---------------------------------------------------------------------------------
+# list of directories containing libraries, this must be the top level containing
+# include and lib
+#---------------------------------------------------------------------------------
+LIBDIRS := $(PORTLIBS) $(LIBNX)
+
+
+#---------------------------------------------------------------------------------
+# no real need to edit anything past this point unless you need to add additional
+# rules for different file extensions
+#---------------------------------------------------------------------------------
+ifneq ($(BUILD),$(notdir $(CURDIR)))
+#---------------------------------------------------------------------------------
+
+export OUTPUT   := $(CURDIR)/$(TARGET)
+export TOPDIR   := $(CURDIR)
+
+# Recherche récursive de tous les dossiers sources
+SOURCE_DIRS := $(shell find $(SOURCES) -type d)
+
+export VPATH := \
+	$(foreach dir,$(SOURCE_DIRS),$(CURDIR)/$(dir)) \
+	$(foreach dir,$(DATA),$(CURDIR)/$(dir))
+
+export DEPSDIR := $(CURDIR)/$(BUILD)
+
+CFILES := $(foreach dir,$(SOURCE_DIRS),$(notdir $(wildcard $(dir)/*.c)))
+CPPFILES := $(foreach dir,$(SOURCE_DIRS),$(notdir $(wildcard $(dir)/*.cpp)))
+SFILES := $(foreach dir,$(SOURCE_DIRS),$(notdir $(wildcard $(dir)/*.s)))
+
+BINFILES := $(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
+
+#---------------------------------------------------------------------------------
+# use CXX for linking C++ projects, CC for standard C
+#---------------------------------------------------------------------------------
+ifeq ($(strip $(CPPFILES)),)
+#---------------------------------------------------------------------------------
+    export LD   := $(CC)
+#---------------------------------------------------------------------------------
+else
+#---------------------------------------------------------------------------------
+    export LD   := $(CXX)
+#---------------------------------------------------------------------------------
+endif
+#---------------------------------------------------------------------------------
+
+export OFILES_BIN   := $(addsuffix .o,$(BINFILES))
+export OFILES_SRC   := $(CPPFILES:.cpp=.o) $(CFILES:.c=.o) $(SFILES:.s=.o)
+export OFILES       := $(OFILES_BIN) $(OFILES_SRC)
+export HFILES_BIN   := $(addsuffix .h,$(subst .,_,$(BINFILES)))
+
+export INCLUDE  := $(foreach dir,$(INCLUDES),-I$(TOPDIR)/$(dir)) \
+                   $(foreach dir,$(LIBDIRS),-I$(dir)/include) \
+                   -I$(TOPDIR)/$(BUILD)
+
+export LIBPATHS := $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
+
+ifeq ($(strip $(CONFIG_JSON)),)
+    jsons := $(wildcard *.json)
+    ifneq (,$(findstring $(TARGET).json,$(jsons)))
+        export APP_JSON := $(TOPDIR)/$(TARGET).json
+    else
+        ifneq (,$(findstring config.json,$(jsons)))
+            export APP_JSON := $(TOPDIR)/config.json
+        endif
+    endif
+else
+    export APP_JSON := $(TOPDIR)/$(CONFIG_JSON)
+endif
+
+ifeq ($(strip $(ICON)),)
+    icons := $(wildcard *.jpg)
+    ifneq (,$(findstring $(TARGET).jpg,$(icons)))
+        export APP_ICON := $(TOPDIR)/$(TARGET).jpg
+    else
+        ifneq (,$(findstring icon.jpg,$(icons)))
+            export APP_ICON := $(TOPDIR)/icon.jpg
+        endif
+    endif
+else
+    export APP_ICON := $(TOPDIR)/$(ICON)
+endif
+
+ifeq ($(strip $(NO_ICON)),)
+    export NROFLAGS += --icon=$(APP_ICON)
+endif
+
+ifeq ($(strip $(NO_NACP)),)
+    export NROFLAGS += --nacp=$(CURDIR)/$(TARGET).nacp
+endif
+
+ifneq ($(APP_TITLEID),)
+    export NACPFLAGS += --titleid=$(APP_TITLEID)
+endif
+
+ifneq ($(ROMFS),)
+    export NROFLAGS += --romfsdir=$(CURDIR)/$(ROMFS)
+endif
+
+.PHONY: $(BUILD) clean all dist
+
+#---------------------------------------------------------------------------------
+all: $(BUILD)
+
+#---------------------------------------------------------------------------------
+# dist: create SD card structure ZIP
+#---------------------------------------------------------------------------------
+dist: all
+	@echo "Creating SD card structure..."
+	@rm -rf dist
+	@mkdir -p dist/switch/.overlays
+	@cp $(TARGET).ovl dist/switch/.overlays/ 2>/dev/null || true
+	@echo "Creating ZIP..."
+	@cd dist && zip -r ../$(TARGET).zip .
+	@echo "Created $(TARGET).zip"
+
+$(BUILD):
+	@[ -d $@ ] || mkdir -p $@
+	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+
+#---------------------------------------------------------------------------------
+clean:
+	@rm -fr $(BUILD) $(TARGET).ovl $(TARGET).nro $(TARGET).nacp $(TARGET).elf dist $(TARGET).zip
+
+
+#---------------------------------------------------------------------------------
+else
+.PHONY: all
+
+DEPENDS := $(OFILES:.o=.d)
+
+#---------------------------------------------------------------------------------
+# main targets
+#---------------------------------------------------------------------------------
+all:    $(OUTPUT).ovl
+
+$(OUTPUT).ovl:      $(OUTPUT).elf $(OUTPUT).nacp
+	@elf2nro $< $@ $(NROFLAGS)
+	@echo "built ... $(notdir $(OUTPUT).ovl)"
+
+$(OUTPUT).elf:  $(OFILES)
+
+$(OFILES_SRC):  $(HFILES_BIN)
+
+#---------------------------------------------------------------------------------
+# you need a rule like this for each extension you use as binary data
+#---------------------------------------------------------------------------------
+%.bin.o %_bin.h:    %.bin
+#---------------------------------------------------------------------------------
+	@echo $(notdir $<)
+	@$(bin2o)
+
+-include $(DEPENDS)
+
+#---------------------------------------------------------------------------------------
+endif
+#---------------------------------------------------------------------------------------

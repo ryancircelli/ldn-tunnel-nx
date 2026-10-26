@@ -1,0 +1,45 @@
+{
+  "name": "ldn-tunnel-relay",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "test": "tsc --noEmit && vitest run",
+    "logs": "node --experimental-transform-types tools/logs.ts",
+    "release": "node --experimental-transform-types tools/release.ts",
+    "promote": "node --experimental-transform-types tools/promote.ts",
+    "status": "node --experimental-transform-types tools/update-status.ts",
+    "test:e2e": "node --experimental-transform-types tools/e2e.ts",
+    "test:e2e-docker": "node --experimental-transform-types --disable-warning=ExperimentalWarning test/e2e-docker.ts",
+    "bundle": "node --experimental-transform-types tools/bundle.ts",
+    "start:node": "node --experimental-transform-types src/node/server.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.4.4",
+    "@types/node": "^22.20.5",
+    "@types/ws": "^8.18.2",
+    "typescript": "^5.9.3",
+    "vitest": "~4.1",
+    "wrangler": "^4.151.1"
+  },
+  "cloudflare": {
+    "bindings": {
+      "ADMIN": {
+        "description": "Password for your relay's admin page at https://<your relay>/admin, where you invite consoles and update the relay. Pick a long one and keep it."
+      },
+      "CF_API_TOKEN": {
+        "description": "Optional, for the one-click update button: an API token with the Workers Scripts Edit permission (create it at dash.cloudflare.com > My Profile > API Tokens, or with the link in the README). Leave empty to skip."
+      },
+      "CF_ACCOUNT_ID": {
+        "description": "Optional, with CF_API_TOKEN: your Cloudflare account ID (dashboard > Workers & Pages, right side, \"Account ID\")."
+      },
+      "CF_WORKER_NAME": {
+        "description": "The name you give this Worker below. Leave it as ldn-tunnel unless you renamed the Worker."
+      }
+    }
+  },
+  "dependencies": {
+    "fflate": "^0.8.3",
+    "ws": "^8.22.0"
+  }
+}

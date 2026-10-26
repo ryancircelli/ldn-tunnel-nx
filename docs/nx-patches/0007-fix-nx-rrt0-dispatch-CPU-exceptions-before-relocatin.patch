@@ -1,0 +1,89 @@
+From a8def81e83d4e32fe3d05a2138dc0f46d1bd999e Mon Sep 17 00:00:00 2001
+From: Ryan Circelli <ryancircelli@gmail.com>
+Date: Sun, 25 Oct 2026 20:27:05 -0400
+Subject: [PATCH] fix(nx/rrt0): dispatch CPU exceptions before relocating
+
+On a CPU exception Horizon re-enters the process at its entry point with
+x0 = exception type and x1 = the exception info. rrt0 only told the
+cases apart after re-running relocation and clearing .bss, which wipes
+the heap and every static, then faults on locked memory (the bsd:s
+transfer memory). creport then records that second fault inside
+__nx_rrt0_entry and the real one is lost.
+
+Check the entry arguments first in rrt0.s, as libnx's crt0 does (x0 != 0
+and x1 != -1), and branch straight to __nx_exception_dispatch without
+touching the stack. Its default now returns from the exception with
+0xF801 (UnhandledUserInterrupt), libnx's default: the kernel restores the
+faulting context and stops the process there, so the crash report shows
+the original fault. Exiting with 0x6C01 left no report at all.
+
+Signed-off-by: Ryan Circelli <ryancircelli@gmail.com>
+---
+ src/exception.rs | 10 ++++------
+ src/rrt0.rs      |  2 +-
+ src/rrt0.s       | 12 +++++++++++-
+ 3 files changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/src/exception.rs b/src/exception.rs
+index 337bf25..560e1a3 100755
+--- a/src/exception.rs
++++ b/src/exception.rs
+@@ -1,6 +1,5 @@
+ //! Exception handling support (stubbed for now).
+ 
+-use crate::diag::abort::{AbortLevel, abort};
+ use crate::result::ResultCode;
+ use crate::svc;
+ 
+@@ -10,9 +9,8 @@ pub(crate) unsafe extern "C" fn __nx_exception_dispatch(
+     _reason: svc::ExceptionType,
+     _stack_top: *mut u8,
+ ) -> ! {
+-    // immediately exit if a crate consumer hasn't definite their own exception handler.
+-    abort(
+-        AbortLevel::ProcessExit(),
+-        ResultCode::new(0x6C01 /* StopProcessingException */),
+-    );
++    // No handler of our own: report the exception as unhandled (libnx's default,
++    // UnhandledUserInterrupt) so the kernel restores the faulting context and stops the
++    // process there, and Atmosphere's creport records the original fault.
++    svc::return_from_exception(ResultCode::new(0xF801))
+ }
+diff --git a/src/rrt0.rs b/src/rrt0.rs
+index 70cd754..62a6be0 100755
+--- a/src/rrt0.rs
++++ b/src/rrt0.rs
+@@ -398,7 +398,7 @@ unsafe extern "C" fn __nx_rrt0_entry(arg0: usize, arg1: usize) -> ! {
+     Possible entry arguments:
+     - NSO/KIP: x0 = 0, x1 = <main-thread-handle>
+     - NRO (hbl): x0 = <abi-config-entries-ptr>, x1 = usize::MAX
+-    - Exception: x0 = <exception-type>, x1 = <stack-top>
++    - Exception: x0 = <exception-type>, x1 = <exception-info> (dispatched by rrt0.s; never reaches here)
+     */
+     let loader_mode = match (arg0, arg1) {
+         (0, main_thread_handle) => LoaderMode::Nso(main_thread_handle as u32),
+diff --git a/src/rrt0.s b/src/rrt0.s
+index 13e93a5..99f1205 100755
+--- a/src/rrt0.s
++++ b/src/rrt0.s
+@@ -3,6 +3,16 @@
+ 
+ .global _start
+ _start:
+-	b __nx_rrt0_entry
++	b __nx_rrt0_start
+ 	.word __module_header - _start
+ 	.ascii "HOMEBREW"
++
++// A CPU exception re-enters the process here with x0 = exception type (non-zero) and
++// x1 = the exception info (not -1), as libnx's crt0 checks. Dispatch before anything
++// else: re-running relocation and the .bss clear would wipe the process and fault again
++// (on locked memory such as transfer memory), hiding the original fault.
++__nx_rrt0_start:
++	cbz x0, __nx_rrt0_entry
++	cmn x1, #1
++	b.eq __nx_rrt0_entry
++	b __nx_exception_dispatch
+-- 
+2.34.1
+

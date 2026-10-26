@@ -1,0 +1,126 @@
+# Every push and pull request. Jobs call the Makefile targets, so `make test lint check` locally runs
+# the same thing (docs/testing.md). A new host test suite goes into TESTS in the Makefile and the rust job.
+name: ci
+on:
+  push:
+    branches: ["**"] # tags go to release.yml
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NX_REV: 0dfe4a3ca6de4dcb0dfabed7dbfe9cacbbe21fcc # same as release.yml and crates/sys/README.md
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates/tls
+            crates/ipc-tests
+      - run: make test-core test-tls test-ipc
+      - run: make lint-host
+
+  # The Horizon module: clippy, the build, then the binary gates (stack frames, exefs size).
+  module:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml) + llvm-tools for the gates
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add llvm-tools
+      - uses: actions/cache@v4
+        id: nx
+        with:
+          path: ~/.cargo/bin/cargo-nx
+          key: cargo-nx-${{ env.CARGO_NX_REV }}
+      - name: Install cargo-nx
+        if: steps.nx.outputs.cache-hit != 'true'
+        run: cargo +stable install --locked cargo-nx --git https://github.com/aarch64-switch-rs/cargo-nx --rev "$CARGO_NX_REV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/sys
+      - run: make lint-sys
+      - run: make nsp
+      - run: make check
+
+  overlay:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64
+    defaults:
+      run:
+        shell: bash # -eo pipefail: a failed make fails the step through the tee
+    steps:
+      - uses: actions/checkout@v4
+      - run: make -C overlay -j"$(nproc)" 2>&1 | tee build.log
+      - name: No compiler warnings (the overlay builds clean today)
+        run: "! grep -n 'warning:' build.log"
+
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: relay/package-lock.json
+      - run: npm ci
+        working-directory: relay
+      - run: make test-relay # tsc --noEmit, vitest (workerd + Node), tools/hw-check.test.ts
+
+  # The Docker image through docker run and the real docker-compose.yml + Caddy, against a fake GitHub release.
+  relay-docker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: relay/package-lock.json
+      - run: npm ci
+      - run: npm run test:e2e-docker
+
+  release-tools:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: make test-release
+
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # deny.toml explains why Apache-2.0 is allowed (GPL-2.0-or-later module only)
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          manifest-path: Cargo.toml
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          manifest-path: crates/tls/Cargo.toml
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+          manifest-path: crates/sys/Cargo.toml

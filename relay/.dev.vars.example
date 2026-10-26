@@ -1,0 +1,7 @@
+# Secrets. The Deploy to Cloudflare button asks for each of these; locally, copy this file to .dev.vars.
+# Password for your relay's admin page (https://<your relay>/admin). Pick a long one.
+ADMIN=choose-a-long-password
+# Optional, for the one-click update on the admin page: an API token that can edit this Worker, and your
+# Cloudflare account id. Leave empty to update by redeploying instead (see README).
+CF_API_TOKEN=
+CF_ACCOUNT_ID=

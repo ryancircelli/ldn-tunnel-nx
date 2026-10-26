@@ -1,0 +1,5 @@
+{
+    "name": "@NAME@",
+    "tid": "0x@PROGRAM_ID@",
+    "requires_reboot": true
+}

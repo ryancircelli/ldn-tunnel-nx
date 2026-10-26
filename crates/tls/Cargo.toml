@@ -1,0 +1,63 @@
+[package]
+name = "ldn-tunnel-tls"
+description = "Blocking no_std TLS client (rustls + RustCrypto) over a caller-supplied byte transport"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+publish = false
+
+
+[lib]
+doctest = false
+
+[features]
+# Host-only: enables the tests (std TcpStream as the transport; net.rs needs internet).
+std = ["embedded-io/std"]
+
+[dependencies]
+embedded-io = { version = "0.7", default-features = false }
+rustls = { version = "0.23.46", default-features = false, features = ["tls12"] }
+rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["alloc", "tls12"] }
+
+# rand_core's OsRng (pulled in by rustls-rustcrypto) needs a getrandom backend to compile on Horizon.
+# It is never called: connect() takes the RNG explicitly.
+[target.'cfg(target_os = "horizon")'.dependencies]
+getrandom = { version = "0.2", default-features = false, features = ["custom"] }
+
+[dev-dependencies]
+embedded-io-adapters = { version = "0.7", features = ["std"] }
+# Private-CA test only: certificate generation and a local TLS listener.
+rcgen = "0.14"
+rustls = { version = "0.23.46", default-features = false, features = ["std", "tls12"] }
+
+[[test]]
+name = "net"
+required-features = ["std"]
+
+[[test]]
+name = "heap"
+required-features = ["std"]
+
+[[test]]
+name = "private_ca"
+required-features = ["std"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# Not a workspace member, so it cannot inherit [workspace.lints]; keep in sync with the root Cargo.toml.
+[lints.rust]
+unsafe_code = "deny" # src/lib.rs has #![forbid]; only tests/heap.rs (counting allocator) opts out
+
+[lints.clippy]
+indexing_slicing = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+arithmetic_side_effects = "warn"

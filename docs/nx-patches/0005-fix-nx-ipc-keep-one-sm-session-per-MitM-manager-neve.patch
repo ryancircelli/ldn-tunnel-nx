@@ -1,0 +1,108 @@
+From 6f60df20cfbd79b66474bd564fa536f8291d835c Mon Sep 17 00:00:00 2001
+From: Ryan Circelli <ryancircelli@gmail.com>
+Date: Sun, 25 Oct 2026 18:55:07 -0400
+Subject: [PATCH] fix(nx/ipc): keep one sm session per MitM manager, never
+ detach it
+
+sm answers sm: on a single thread and asks a MitM's ShouldMitm with a
+synchronous request while holding its lock. A MitM thread that calls sm
+while sm is asking it deadlocks both, and with sm stuck every service
+lookup in the system hangs.
+
+The manager opened a fresh sm session for each install and each
+acknowledged session, and after the call that lets sm query us again
+(ClearFutureMitm, AcknowledgeMitmSession: both resume the lookups sm
+deferred) it still sent DetachClient and a Close. Any lookup of the
+service that was deferred in that window turns into a ShouldMitm the
+thread can no longer answer. A live restart of the module, with the
+system's processes already running, is the likeliest time for that.
+
+Open the session once, before the first install, and keep it: the only
+sm calls left on a MitM thread happen while sm defers lookups of that
+service, and the last one returns straight into the server loop.
+
+Signed-off-by: Ryan Circelli <ryancircelli@gmail.com>
+---
+ src/ipc/server.rs | 32 ++++++++++++++++++++++++--------
+ 1 file changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index f555f70..8c9ee46 100755
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -743,6 +743,15 @@ pub struct ServerManager<const P: usize> {
+     server_holders: Vec<ServerHolder>,
+     wait_handles: [svc::Handle; MAX_COUNT],
+     pointer_buffer: [u8; P],
++    /// The sm session MitM servers install and acknowledge through, opened before the first
++    /// install and never closed. sm answers `sm:` on one thread and asks a MitM's ShouldMitm
++    /// synchronously, so a MitM thread may only call sm while sm cannot be asking it: before
++    /// its install, until ClearFutureMitm (lookups of the service are deferred), and inside an
++    /// acknowledge (deferred while sm waits for the ack). A per-call session adds a
++    /// DetachClient and a Close after those windows: if sm has started a ShouldMitm to this
++    /// thread meanwhile, both sides wait on each other and every sm client hangs.
++    #[cfg(feature = "services")]
++    mitm_sm: Option<sm::UserInterface>,
+ }
+ 
+ impl<const P: usize> ServerManager<P> {
+@@ -751,6 +760,8 @@ impl<const P: usize> ServerManager<P> {
+             server_holders: Vec::new(),
+             wait_handles: [0; MAX_COUNT],
+             pointer_buffer: [0; P],
++            #[cfg(feature = "services")]
++            mitm_sm: None,
+         })
+     }
+ 
+@@ -1097,7 +1108,11 @@ impl<const P: usize> ServerManager<P> {
+                         if server_holder.is_mitm_service {
+                             #[cfg(feature = "services")]
+                             {
+-                                let sm = service::new_named_port_object::<sm::UserInterface>()?;
++                                // Set by register_mitm_service_server, the only way to get here.
++                                let sm = self
++                                    .mitm_sm
++                                    .as_ref()
++                                    .ok_or(rc::ResultSignaledServerNotFound::make())?;
+                                 let (info, session_handle) = sm
+                                     .atmosphere_acknowledge_mitm_session(
+                                         server_holder.service_name,
+@@ -1108,7 +1123,6 @@ impl<const P: usize> ServerManager<P> {
+                                     info,
+                                     server_holder.service_name,
+                                 )?);
+-                                sm.detach_client(sf::ProcessId::new())?;
+                             }
+                         } else {
+                             new_sessions.push(server_holder.make_new_session(new_handle)?);
+@@ -1233,18 +1247,20 @@ impl<const P: usize> ServerManager<P> {
+     pub fn register_mitm_service_server<S: IMitmService + 'static>(&mut self) -> Result<()> {
+         let service_name = S::get_name();
+ 
+-        let sm = service::new_named_port_object::<sm::UserInterface>()?;
++        if self.mitm_sm.is_none() {
++            self.mitm_sm = Some(service::new_named_port_object::<sm::UserInterface>()?);
++        }
++        let sm = self.mitm_sm.as_ref().ok_or(rc::ResultSignaledServerNotFound::make())?;
+         let (mitm_handle, query_handle) = sm.atmosphere_install_mitm(service_name)?;
++        // Last sm call: from its reply on, sm may ask this thread's query session, which
++        // waits in the kernel until the loop serves it.
++        let cleared = sm.atmosphere_clear_future_mitm(service_name);
+ 
+         self.register_mitm_server::<S>(mitm_handle.handle, service_name);
+-
+         let mitm_query_srv: Rc<Mutex<MitmQueryService<S>>> =
+             Rc::new(Mutex::new(MitmQueryService::<S>::new()));
+         self.register_session(query_handle.handle, mitm_query_srv);
+-
+-        sm.atmosphere_clear_future_mitm(service_name)?;
+-        sm.detach_client(sf::ProcessId::new())?;
+-        Ok(())
++        cleared
+     }
+ 
+     pub fn register_named_port_server<S: INamedPort + 'static>(&mut self) -> Result<()> {
+-- 
+2.34.1
+

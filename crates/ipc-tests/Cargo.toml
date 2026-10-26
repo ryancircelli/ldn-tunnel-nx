@@ -1,0 +1,44 @@
+[package]
+name = "ldn-tunnel-ipc-tests"
+description = "Host tests of the IPC message layouts nx and crates/sys put on the wire"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+publish = false
+
+# Own workspace, like crates/sys: nightly nx sources, not part of the core workspace.
+[workspace]
+
+# The library is nx's IPC layer built for the host: vendor/nx/src/ipc_host.rs.
+[lib]
+name = "nx"
+path = "../../vendor/nx/src/ipc_host.rs"
+test = false
+doctest = false
+
+[dependencies]
+# nx's own dependencies (vendor/nx/Cargo.toml), those the IPC modules use.
+paste = "1.0"
+arrayvec = { version = "0.7.8", default-features = false }
+static_assertions = "1.1.0"
+lock_api = { version = "0.4.12", features = ["nightly"] }
+atomic_enum = "0.3.0"
+zeroize = { version = "1.8.1" }
+nx-derive = { path = "../../vendor/nx/nx-derive/" }
+bitfield-struct = "0.13.0"
+enum-iterator = "2.1.0"
+logpacket = { git = "https://github.com/aarch64-switch-rs/logpacket", tag = "0.1.0" }
+
+[dev-dependencies]
+ldn-tunnel-core = { path = "../core" }
+zerocopy = "0.8"
+
+[features]
+default = ["services"]
+# As crates/sys builds nx (its "fs" feature turns on "services").
+services = []
+# Named by #[cfg]s in the shared nx sources; their modules are not part of the host build.
+fs = []
+socket = []
+rand = []
+applet = []

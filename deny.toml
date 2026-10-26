@@ -1,0 +1,28 @@
+# cargo deny --manifest-path <crate>/Cargo.toml check licenses   (crates/core, crates/tls, crates/sys)
+# The module is GPL-2.0-or-later (docs/LICENSING.md). Allowed: permissive licences that combine
+# with it. Apache-2.0 is incompatible with GPL-2.0-only; it is allowed here ONLY because the module
+# is "or later" (the combination is then distributed under GPLv3). embedded-tls is the one crate
+# that offers no MIT/ISC alternative. If the module ever has to become GPL-2.0-only, drop
+# Apache-2.0-only crates and remove it from this list.
+[licenses]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+allow = [
+  "MIT",
+  "ISC",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Apache-2.0",   # "or later" only, see above; dual MIT OR Apache-2.0 crates are fine either way
+  "Zlib",
+  "CC0-1.0",
+  "0BSD",
+  "Unicode-3.0",
+  "MPL-2.0",
+]
+
+[licenses.private]
+# our own crates (publish = false) carry GPL-2.0-or-later
+ignore = true
+
+[bans]
+multiple-versions = "allow"

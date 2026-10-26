@@ -1,0 +1,32 @@
+# Relay + Caddy (automatic HTTPS). Setup: cp docker.env.example .env, edit it, docker compose up -d
+services:
+  relay:
+    image: ghcr.io/ryancircelli/ldn-tunnel-relay:${RELAY_VERSION:-latest} # tags are v<semver>
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TRUST_PROXY: "1" # Caddy below replaces X-Forwarded-For with the real client; 8080 is not published
+    volumes:
+      - relay-data:/data # sqlite database
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [relay]
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN:?set RELAY_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data # certificates
+      - caddy-config:/config
+
+volumes:
+  relay-data:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,149 @@
+From 384e53c4bce6764939e0052e99f0daa86f3c500d Mon Sep 17 00:00:00 2001
+From: Ryan Circelli <ryancircelli@gmail.com>
+Date: Sun, 25 Oct 2026 18:54:53 -0400
+Subject: [PATCH] fix(nx/sync): stop Mutex::lock spinning forever under
+ contention
+
+lock_contended only did anything while the value it held had no wait
+bit. A thread that found the lock owned with the wait bit already set (a
+third contender, or a lost race with an unlock) looped without reloading
+the value or sleeping: a busy loop at the thread's priority that never
+ends, even after the lock is freed. Our threads all run on core 3, so a
+spinning ldn:u thread (priority 34) starves everything below it on that
+core: HOME and the power menu stop responding.
+
+Follow libnx mutexLock/mutexUnlock instead: set the wait bit with a
+compare-exchange, sleep in svcArbitrateLock, re-read after every step.
+Unlock only clears the value when there are no waiters (and with Release
+ordering); with waiters the kernel writes the next owner, so a try_lock
+can no longer slip in between the clear and svcArbitrateUnlock.
+
+Signed-off-by: Ryan Circelli <ryancircelli@gmail.com>
+---
+ src/sync/sys/mutex.rs | 97 +++++++++++++++++++++----------------------
+ 1 file changed, 48 insertions(+), 49 deletions(-)
+
+diff --git a/src/sync/sys/mutex.rs b/src/sync/sys/mutex.rs
+index b0831b3..7c1063c 100755
+--- a/src/sync/sys/mutex.rs
++++ b/src/sync/sys/mutex.rs
+@@ -53,68 +53,67 @@ impl Mutex {
+         }
+     }
+ 
++    /// libnx `mutexLock`: owned → make sure the wait bit is set, then let the kernel queue
++    /// us behind the owner; re-read after every step. Every path either takes the lock,
++    /// sleeps in `svcArbitrateLock`, or retries on a fresh value, so it never spins.
+     #[cold]
+     fn lock_contended(&self, mut state: u32, current_thread: u32) {
+         loop {
+-            // If the state isn't marked as contended yet, mark it
+-            if state & WAIT_MASK == 0 {
+-                // check if we have just caught an unlocked mutex while setting the wait flag
+-                // this should only happen when an uncontended mutex unlocks, so we can just try to
+-                // lock without worrying about the kernel giving it to a waiter
+-                if self.owner_thread_handle.fetch_or(WAIT_MASK, Acquire) == svc::INVALID_HANDLE {
+-                    // we have found an unlocked mutex by chance, try to lock it
+-                    match self.owner_thread_handle.compare_exchange(
+-                        svc::INVALID_HANDLE | WAIT_MASK,
+-                        current_thread,
+-                        Acquire,
+-                        Relaxed,
+-                    ) {
+-                        Ok(_) => {
+-                            // we locked by replacing our written wait mask with the new handle value
+-                            return;
+-                        }
+-                        Err(s) => {
+-                            state = s;
+-                        }
++            if state == svc::INVALID_HANDLE {
++                match self.owner_thread_handle.compare_exchange(
++                    svc::INVALID_HANDLE,
++                    current_thread,
++                    Acquire,
++                    Relaxed,
++                ) {
++                    Ok(_) => return,
++                    Err(s) => {
++                        state = s;
++                        continue;
+                     }
+                 }
+-
+-                // we didn't luck into a lock, and the value is not flagged for aribitration.
+-                // we can wait for the kernel to hand us the value
+-                if let Err(rc) = unsafe {
+-                    svc::arbitrate_lock(
+-                        state & !WAIT_MASK,
+-                        &self.owner_thread_handle as *const _ as _,
+-                        current_thread,
+-                    )
+-                } {
+-                    abort::abort(abort::AbortLevel::Panic(), rc);
+-                }
+-
+-                // we should have the value here, but libnx and nnSdk check
+-                state = self.owner_thread_handle.load(Acquire);
+-                if state & !WAIT_MASK == current_thread {
+-                    return;
+-                }
++            }
++            if state & WAIT_MASK == 0
++                && let Err(s) = self.owner_thread_handle.compare_exchange(
++                    state,
++                    state | WAIT_MASK,
++                    Relaxed,
++                    Relaxed,
++                )
++            {
++                state = s;
++                continue;
++            }
++            if let Err(rc) = unsafe {
++                svc::arbitrate_lock(
++                    state & !WAIT_MASK,
++                    &self.owner_thread_handle as *const _ as _,
++                    current_thread,
++                )
++            } {
++                abort::abort(abort::AbortLevel::Panic(), rc);
++            }
++            // The kernel hands the lock straight to the waiter it wakes.
++            state = self.owner_thread_handle.load(Acquire);
++            if state & !WAIT_MASK == current_thread {
++                return;
+             }
+         }
+     }
+ 
++    /// libnx `mutexUnlock`. With waiters the value is left for the kernel, which writes the
++    /// next owner (zeroing it first would let a `try_lock` in and give the lock out twice).
++    ///
+     /// # Safety
+     ///
+-    /// This can only be called on a mutex that has been locked by the owner/borrower as it will directly overwrite
+-    /// the value without checking if it was already
++    /// Only the thread holding the lock may call this.
+     #[inline]
+     pub unsafe fn unlock(&self) {
+-        let state = self.owner_thread_handle.swap(svc::INVALID_HANDLE, Acquire);
+-
+-        //debug_assert!(state & !WAIT_MASK == 0, "Tried to unlock and unlocked mutex");
+-
+-        // we're actually not going to check the assert below, as we want to support having a Mutex that is Sync,
+-        // and/or a MutexGuard that is Sync/Send
+-        // assert_eq!(current_thread, state & !WAIT_MASK, "We are unlocking a mutex that isn't owned by the current thread");
+-
+-        if state & WAIT_MASK != 0
++        let current_thread = get_current_thread_handle();
++        if self
++            .owner_thread_handle
++            .compare_exchange(current_thread, svc::INVALID_HANDLE, Release, Relaxed)
++            .is_err()
+             && let Err(rc) =
+                 unsafe { svc::arbitrate_unlock(&self.owner_thread_handle as *const _ as _) }
+         {
+-- 
+2.34.1
+

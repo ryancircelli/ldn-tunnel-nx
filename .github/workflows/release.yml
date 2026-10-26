@@ -1,0 +1,164 @@
+# Tag v<semver> -> build module, overlay and relay, sign, verify, and open a DRAFT GitHub Release
+# (the owner publishes it by hand) + push ghcr.io/<owner>/ldn-tunnel-relay:v<semver>.
+# Secret needed: PUBLISHER_KEY (P-256 private key, PEM or 64 hex chars). GITHUB_TOKEN is automatic.
+# One key: the module is built with the public key in relay/src/core/publisher_key.ts, and the bundle
+# signed with PUBLISHER_KEY must verify against that same file before anything is uploaded.
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_NX_REV: 0dfe4a3ca6de4dcb0dfabed7dbfe9cacbbe21fcc # keep in sync with crates/sys/README.md
+
+jobs:
+  module:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.ver.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build number, version and update key for the console
+        id: ver
+        run: |
+          set -eu
+          key=$(grep -oE '"04[0-9a-f]{128}"' relay/src/core/publisher_key.ts | tr -d '"')
+          fixture=$(od -An -tx1 -v tools/release/test/fixture-pubkey.bin | tr -d ' \n')
+          # the fixture's private half is in this repo: anyone could sign an update with it
+          test "$key" != "$fixture" || { echo "publisher_key.ts holds the test key"; exit 1; }
+          # the manifest (publish job) carries the same build; consoles install only a higher one
+          build=$(date +%s)
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          { echo "LDNT_BUILD=$build"; echo "LDNT_VERSION=$GITHUB_REF_NAME"; echo "LDNT_UPDATE_PUBKEY=$key"; } >> "$GITHUB_ENV"
+      - name: Toolchain from rust-toolchain.toml + llvm-tools for make check
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add llvm-tools
+      - uses: actions/cache@v4
+        id: nx
+        with:
+          path: ~/.cargo/bin/cargo-nx
+          key: cargo-nx-${{ env.CARGO_NX_REV }}
+      - name: Install cargo-nx
+        if: steps.nx.outputs.cache-hit != 'true'
+        run: cargo +stable install --locked cargo-nx --git https://github.com/aarch64-switch-rs/cargo-nx --rev "$CARGO_NX_REV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/sys
+      - run: make nsp
+      - run: make check # the same binary gates as ci.yml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module
+          path: crates/sys/target/aarch64-nintendo-switch-freestanding/release/ldn-tunnel.nsp
+          if-no-files-found: error
+
+  overlay:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64
+    steps:
+      - uses: actions/checkout@v4
+      - run: make -C overlay -j"$(nproc)" # writes overlay/ldn-tunnel.ovl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: overlay
+          path: overlay/ldn-tunnel.ovl
+          if-no-files-found: error
+
+  relay:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v4
+      - name: relay/release.json must name this repository and tag
+        # the relay serves the console files of that release; Deploy-button copies of main read it too
+        run: |
+          pin=$(jq -r '.repo + " " + .tag' release.json)
+          test "$pin" = "$GITHUB_REPOSITORY $GITHUB_REF_NAME" || { echo "relay/release.json pins $pin: set $GITHUB_REPOSITORY $GITHUB_REF_NAME, commit, tag again"; exit 1; }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: relay/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - name: Build the Worker zip (no deploy)
+        run: npm run bundle -- --out relay-cloudflare.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay
+          path: relay/relay-cloudflare.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [module, overlay, relay]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # draft release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Assemble the bundle
+        run: |
+          mkdir bundle
+          cp dl/module/ldn-tunnel.nsp bundle/exefs.nsp
+          cp dl/overlay/ldn-tunnel.ovl dl/relay/relay-cloudflare.zip bundle/
+      - name: Sign
+        env:
+          PUBLISHER_KEY: ${{ secrets.PUBLISHER_KEY }}
+          BUILD: ${{ needs.module.outputs.build }}
+        run: |
+          set -eu
+          test -n "$PUBLISHER_KEY" || { echo "secret PUBLISHER_KEY is not set"; exit 1; }
+          T=tools/release/release.ts
+          node $T sign-manifest --exefs bundle/exefs.nsp --overlay bundle/ldn-tunnel.ovl \
+            --version "$GITHUB_REF_NAME" --build "$BUILD" --out bundle/manifest.bin
+          node $T release-json --dir bundle
+      - name: Verify against the key the consoles and relays trust
+        # publisher_key.ts is LDNT_UPDATE_PUBKEY of the module job: fails when PUBLISHER_KEY is another key
+        run: node tools/release/release.ts verify --dir bundle --pubkey relay/src/core/publisher_key.ts
+      - name: SD-card zip
+        run: make dist EXEFS=bundle/exefs.nsp OVL=bundle/ldn-tunnel.ovl VERSION="${GITHUB_REF_NAME#v}"
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "$GITHUB_REF_NAME" \
+            --notes "Source: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/${GITHUB_REF_NAME} (GPL-2.0-or-later module, GPL-2.0 overlay, MIT relay; see docs/LICENSING.md)." \
+            bundle/exefs.nsp bundle/ldn-tunnel.ovl bundle/manifest.bin bundle/relay-cloudflare.zip \
+            bundle/release.json bundle/release.sig dist/out/ldn-tunnel-*.zip
+
+  docker:
+    needs: [relay] # tests and the release.json check passed there
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Lowercase image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ldn-tunnel-relay" >> "$GITHUB_ENV"
+      - uses: docker/build-push-action@v6
+        with:
+          context: relay
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.ref_name }}
+            ${{ env.IMAGE }}:latest
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

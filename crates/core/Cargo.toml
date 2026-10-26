@@ -1,0 +1,23 @@
+[package]
+name = "ldn-tunnel-core"
+description = "Pure, host-testable logic of ldn-tunnel: wire protocol, WebSocket codec, LDN state machine, socket routing, config, whitelist, update manifest verification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+doctest = false
+
+[dependencies]
+base64 = { version = "0.22", default-features = false }
+heapless = { version = "0.9.3", default-features = false }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa"] }
+sha1 = { version = "0.11", default-features = false }
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[dev-dependencies]
+p256 = { version = "0.14.0", features = ["ecdsa", "std"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+target/
+**/target/
+*.nsp
+*.nso
+*.npdm
+*.elf
+*.ovl
+*.zip
+node_modules/
+relay/.wrangler/
+relay/kit/secrets/
+relay/kit/out/
+relay/kit/cache/
+.DS_Store
+dist/out/
+LEAD-STATUS.md
