@@ -45,7 +45,9 @@ function checkConsole(lines: Line[], o: Opts): Row[] {
   step("relay handshake", /ldn: relay handshake done/, "started");
   step("ldn connected", /ldn: connected: (\d+)\/(\d+) nodes/, "relay handshake", () => {
     const max = Math.max(...text.map((t) => Number(/ldn: connected: (\d+)\//.exec(t)?.[1] ?? 0)));
-    return max < o.nodes ? `at most ${max} nodes, expected ${o.nodes}` : null;
+    // The host only logs its own 1/N when it creates the room; the joiners' lines show the full count.
+    const need = text.some((t) => /ldn: connected: \d+\/\d+ nodes, local node 0\b/.test(t)) ? 1 : o.nodes;
+    return max < need ? `at most ${max} nodes, expected ${need}` : null;
   });
   step("socket tracked", /bsd: client \d+ fd \d+ tracked/, "started");
   step("bound to proxy", /bsd: client \d+ fd \d+ bound to the LDN proxy/, "socket tracked");
