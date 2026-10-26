@@ -3,16 +3,20 @@
 #  1. no function's stack frame over FRAME_MAX bytes. Threads run on 16-32 KiB stacks; a
 #     32 KiB frame (a 16 KiB ring buffer on the stack) crashed a console, and nothing else catches it.
 #  2. exefs.nsp no larger than NSP_MAX bytes.
+#  3. static memory (loaded image through .bss, which holds the heap and bsd transfer memory,
+#     plus main.json's main thread stack) no larger than MEM_MAX bytes: Atmosphere gives all
+#     custom sysmodules ~32 MiB together.
 # Frame = pre-indexed pushes (`stp x29, x30, [sp, #-N]!`) + every `sub sp, sp, #N[, lsl #12]` + the
 # stack-probe loop target (`sub x9, sp, #N, lsl #12` ... `cmp sp, x9`) that LLVM emits for large frames.
 # Prints the 10 largest frames.
-#   tools/check-elf.sh [elf] [nsp]       env: FRAME_MAX (8192), NSP_MAX (786432), OBJDUMP
+#   tools/check-elf.sh [elf] [nsp]       env: FRAME_MAX (8192), NSP_MAX (786432), MEM_MAX (2621440), OBJDUMP
 #   tools/check-elf.sh --self-test       the frame parser against llc-built probe-loop/unrolled/plain frames
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REL=crates/sys/target/aarch64-nintendo-switch-freestanding/release
 FRAME_MAX=${FRAME_MAX:-8192}
 NSP_MAX=${NSP_MAX:-786432}
+MEM_MAX=${MEM_MAX:-2621440}
 
 # llvm-objdump (and llc) from the toolchain's llvm-tools component (rustup component add llvm-tools)
 OBJDUMP=${OBJDUMP:-$(command -v llvm-objdump || ls "$(rustc --print sysroot)"/lib/rustlib/*/bin/llvm-objdump 2>/dev/null | head -1 || true)}
@@ -61,9 +65,15 @@ head -10 <<<"$frames" | awk -F'\t' '{ printf "  %7d  %s\n", $1, substr($2, 1, 11
 over=$(awk -F'\t' -v max="$FRAME_MAX" '$1 > max' <<<"$frames" | wc -l)
 size=$(stat -c %s "$NSP")
 echo "exefs.nsp: $size bytes (limit $NSP_MAX)"
+# end of the highest section (Idx Name Size VMA Type rows), page-rounded, + main thread stack
+image=$("$OBJDUMP" -h "$ELF" | awk '$1 ~ /^[0-9]+$/ && NF >= 5 { e = strtonum("0x" $4) + strtonum("0x" $3); if (e > m) m = e } END { print int((m + 4095) / 4096) * 4096 }')
+stack=$(( $(grep -o '"main_thread_stack_size": *"0x[0-9a-fA-F]*"' crates/sys/main.json | grep -o '0x[0-9a-fA-F]*') ))
+mem=$((image + stack))
+echo "static memory: $mem bytes = image $image + main stack $stack (limit $MEM_MAX)"
 
 rc=0
 [ "$over" -eq 0 ] || { echo "FAIL: $over function(s) with a stack frame over $FRAME_MAX bytes (move big buffers to the heap or a static)"; rc=1; }
 [ "$size" -le "$NSP_MAX" ] || { echo "FAIL: exefs.nsp is $size bytes, over $NSP_MAX"; rc=1; }
+[ "$mem" -le "$MEM_MAX" ] || { echo "FAIL: static memory is $mem bytes, over $MEM_MAX"; rc=1; }
 [ "$rc" -ne 0 ] || echo "ok"
 exit $rc

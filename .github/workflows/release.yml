@@ -58,10 +58,12 @@ jobs:
 
   overlay:
     runs-on: ubuntu-latest
-    container: devkitpro/devkita64
     steps:
       - uses: actions/checkout@v4
-      - run: make -C overlay -j"$(nproc)" # writes overlay/ldn-tunnel.ovl
+      - name: Toolchain (rust-toolchain.toml, with aarch64-unknown-none)
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: make overlay-rs # the Rust half (crates/overlay), with the host's cargo
+      - run: docker run --rm -v "$PWD":/work -w /work/overlay devkitpro/devkita64 make -j"$(nproc)" # writes overlay/ldn-tunnel.ovl
       - uses: actions/upload-artifact@v4
         with:
           name: overlay
@@ -102,9 +104,11 @@ jobs:
       contents: write # draft release
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the signing tool
+        run: cargo build --release -p ldn-tunnel-release
       - uses: actions/download-artifact@v4
         with:
           path: dl
@@ -122,13 +126,13 @@ jobs:
         run: |
           set -eu
           test -n "$PUBLISHER_KEY" || { echo "secret PUBLISHER_KEY is not set"; exit 1; }
-          T=tools/release/release.ts
-          node $T sign-manifest --exefs bundle/exefs.nsp --overlay bundle/ldn-tunnel.ovl \
+          T=target/release/ldn-tunnel-release
+          $T sign-manifest --exefs bundle/exefs.nsp --overlay bundle/ldn-tunnel.ovl \
             --version "$GITHUB_REF_NAME" --build "$BUILD" --out bundle/manifest.bin
-          node $T release-json --dir bundle
+          $T release-json --dir bundle
       - name: Verify against the key the consoles and relays trust
         # publisher_key.ts is LDNT_UPDATE_PUBKEY of the module job: fails when PUBLISHER_KEY is another key
-        run: node tools/release/release.ts verify --dir bundle --pubkey relay/src/core/publisher_key.ts
+        run: target/release/ldn-tunnel-release verify --dir bundle --pubkey relay/src/core/publisher_key.ts
       - name: SD-card zip
         run: make dist EXEFS=bundle/exefs.nsp OVL=bundle/ldn-tunnel.ovl VERSION="${GITHUB_REF_NAME#v}"
       - name: Draft release

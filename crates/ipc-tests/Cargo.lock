@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "ldn-tunnel-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "heapless",
@@ -279,13 +279,14 @@ dependencies = [
 
 [[package]]
 name = "ldn-tunnel-ipc-tests"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrayvec",
  "atomic_enum",
  "bitfield-struct",
  "enum-iterator",
  "ldn-tunnel-core",
+ "ldn-tunnel-overlay",
  "lock_api",
  "logpacket",
  "nx-derive",
@@ -293,6 +294,15 @@ dependencies = [
  "static_assertions",
  "zerocopy",
  "zeroize",
+]
+
+[[package]]
+name = "ldn-tunnel-overlay"
+version = "0.1.1"
+dependencies = [
+ "heapless",
+ "ldn-tunnel-core",
+ "zerocopy",
 ]
 
 [[package]]

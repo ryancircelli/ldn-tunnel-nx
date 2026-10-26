@@ -393,6 +393,11 @@ impl<const N: usize> Conn<N> {
         self.ping_echo.is_some()
     }
 
+    /// Clock of the last byte received and sent (as of the last `poll`).
+    pub const fn last_io_ms(&self) -> (u64, u64) {
+        (self.last_rx_ms, self.last_tx_ms)
+    }
+
     fn reset_stream(&mut self) {
         self.phase = Phase::Closed;
         self.len = 0;

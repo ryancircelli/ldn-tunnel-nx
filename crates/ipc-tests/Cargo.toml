@@ -1,7 +1,7 @@
 [package]
 name = "ldn-tunnel-ipc-tests"
 description = "Host tests of the IPC message layouts nx and crates/sys put on the wire"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-2.0-or-later"
 publish = false
@@ -31,6 +31,7 @@ logpacket = { git = "https://github.com/aarch64-switch-rs/logpacket", tag = "0.1
 
 [dev-dependencies]
 ldn-tunnel-core = { path = "../core" }
+ldn-tunnel-overlay = { path = "../overlay" }
 zerocopy = "0.8"
 
 [features]

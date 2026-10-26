@@ -30,7 +30,8 @@ pub enum ManifestResult {
     AlreadyStaged,
 }
 
-fn signature_ok(signed: &[u8], sig: &[u8], pubkey: &[u8; PUBKEY_LEN]) -> bool {
+/// ECDSA P-256 / SHA-256 over `signed`, `sig` raw r || s (64 bytes). Also used by `tools/release`.
+pub fn signature_ok(signed: &[u8], sig: &[u8], pubkey: &[u8; PUBKEY_LEN]) -> bool {
     let Ok(key) = VerifyingKey::from_sec1_bytes(pubkey) else { return false };
     let Ok(sig) = Signature::from_slice(sig) else { return false };
     key.verify(signed, &sig).is_ok()

@@ -11,10 +11,10 @@ import { Relay } from "../src/core/relay.ts";
 import type { Conn, Host } from "../src/core/ports.ts";
 import { Ldn, ip } from "../tools/ldn-client.ts";
 import { PacketId, ProxyConfig } from "../src/core/codec/types.ts";
-import { type Client, type Target, freshLcid, perfBroadcast, perfScan, playSuite, ready, room } from "./play.ts";
+import { type Client, type Target, freshLcid, perfBroadcast, perfScan, playSuite, ready, resume, resumeSuite, room, roster } from "./play.ts";
 
 const TOKEN = "a".repeat(64);
-const ENV = { TOKEN_SWITCH_A: "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb" };
+const ENV = { TOKEN_SWITCH_A: "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb", RESUME_GRACE_MS: "0" };
 const dir = mkdtempSync(join(tmpdir(), "relay-play-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -48,6 +48,35 @@ describe("play (Node)", () => {
   beforeAll(async () => void (srv = await startServer({ port: 0, dbPath, env: ENV })));
   afterAll(() => srv.close());
   playSuite(nodeTarget(() => srv.port, dbPath));
+});
+
+describe("resume (Node)", () => {
+  const dbPath = join(dir, "resume.sqlite");
+  let srv: Awaited<ReturnType<typeof startServer>>;
+  beforeAll(async () => void (srv = await startServer({ port: 0, dbPath, env: { ...ENV, RESUME_GRACE_MS: "15000" } })));
+  afterAll(() => srv.close());
+  resumeSuite(nodeTarget(() => srv.port, dbPath));
+});
+
+describe("Node restart with the resume grace on", () => {
+  it("every console resumes its node in the stored game; the room carries on", async () => {
+    const dbPath = join(dir, "restart-resume.sqlite");
+    const env = { ...ENV, RESUME_GRACE_MS: "15000" };
+    let srv = await startServer({ port: 0, dbPath, env });
+    const t = nodeTarget(() => srv.port, dbPath);
+    const { players, net, lcid } = await room(t, 3);
+    await srv.close(); // every socket goes, as when the Durable Object restarts
+    srv = await startServer({ port: 0, dbPath, env });
+    try {
+      for (const p of players) roster(await resume(t, p, net), players);
+      const [seen] = await (await ready(t)).c.scanAll(lcid);
+      roster(seen, players);
+      players[1].c.proxyData(0, players[0].ip, Uint8Array.of(7));
+      expect((await players[0].c.expect(PacketId.ProxyData)).at(-1)).toBe(7);
+    } finally {
+      await srv.close();
+    }
+  });
 });
 
 describe("Node restart on the same database", () => {

@@ -37,9 +37,15 @@ monotonic clock (`now: u64`).
    This includes Ping: the session echoes the relay's pings, so the shell must not.
    A `Some(ProxyDataIn)` return is game data for the router. The update and log
    extensions (0xC0..=0xC4) are ignored here; route them before or after.
-5. **Transport closed** without being asked: `on_relay_closed(now)`. If the
-   console was in a room, it leaves it, like Ryujinx `OnDisconnected`. It emits no
-   `RelayDisconnect`, so the shell resets the router itself here too.
+5. **Transport closed** without being asked: `on_relay_closed(now)`. In a room
+   the session resumes it (`is_resuming()`): it emits `RelayConnect` again, keeps
+   its state, network info and IP, and on the new link sends `Resume` (0xC5: the
+   old link's session id + the room id); the relay answers ProxyConfig + Connected
+   with the same node and IP. The game is not told. While resuming, the shell keeps
+   the router (the game's proxy sockets) and drops the game's datagrams. A refused
+   Resume or `RESUME_MS` without one ends it as before resuming existed: the room is
+   lost (Ryujinx `OnDisconnected`) and `RelayDisconnect` closes the link. Outside a
+   room it emits no `RelayDisconnect`, so the shell resets the router itself.
 6. **Timers**: call `poll(now)` at `next_deadline()`. When nothing is pending,
    that is only the idle timeout, which closes the link 6 s after leaving a room.
 7. **GetIpv4Address**: `get_ipv4_address()`; `None` means use nifm.
@@ -63,6 +69,7 @@ ScanPrivate is `scan`. `GetNetworkInfoLatestUpdate` is `network_info()` plus
 | Scan | 1000 |
 | Reject | 6000 |
 | Idle after leaving a room | 6000 |
+| Resume a room after its link dropped (relay holds the node 15–25 s) | 12000 |
 
 ## Results
 

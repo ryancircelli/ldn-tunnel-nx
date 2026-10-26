@@ -41,8 +41,13 @@ fn new_pki() -> Pki {
     Pki { root_pem: root.pem(), chain: vec![leaf.der().clone(), inter.der().clone()], key }
 }
 
-/// Serves one TLS connection on 127.0.0.1: answers "ping" with "pong". Returns the port.
+/// Serves one TLS connection on 127.0.0.1: answers "ping" with "pong", then sends close_notify
+/// (or, with `notify` false, just closes TCP). Returns the port.
 fn serve(pki: &Pki) -> u16 {
+    serve_with(pki, true)
+}
+
+fn serve_with(pki: &Pki, notify: bool) -> u16 {
     let key = PrivateKeyDer::Pkcs8(pki.key.serialize_der().into());
     let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(rustls_rustcrypto::provider()))
         .with_safe_default_protocol_versions()
@@ -59,7 +64,9 @@ fn serve(pki: &Pki) -> u16 {
         // Errors are expected in the negative cases (the client aborts the handshake).
         if tls.read_exact(&mut buf).is_ok() && &buf == b"ping" {
             let _ = tls.write_all(b"pong");
-            tls.conn.send_close_notify();
+            if notify {
+                tls.conn.send_close_notify();
+            }
             let _ = tls.flush();
         }
     });
@@ -117,4 +124,23 @@ fn private_root_hostname_mismatch_fails() {
     let pki = new_pki();
     let e = cert_err(session(&pki, "other.test", &pki.root_pem));
     assert!(matches!(e, C::NotValidForName | C::NotValidForNameContext { .. }), "{e:?}");
+}
+
+#[test]
+fn stats_tell_close_notify_from_bare_eof() {
+    let pki = new_pki();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    for (notify, end) in [(true, "close_notify"), (false, "UnexpectedEof")] {
+        let tcp = TcpStream::connect(("127.0.0.1", serve_with(&pki, notify))).unwrap();
+        let rng = rustls_rustcrypto::provider().secure_random;
+        let mut tls = connect("relay.test", pki.root_pem.as_bytes(), FromStd::new(tcp), now, rng).unwrap();
+        tls.write_all(b"ping").unwrap();
+        let mut buf = [0u8; 4];
+        tls.read_exact(&mut buf).unwrap();
+        let r = tls.read(&mut buf);
+        assert_eq!(r.is_ok(), notify, "{r:?}");
+        let s = tls.stats();
+        assert_eq!((s.rx_bytes, s.tx_bytes, s.writes), (4, 4, 1));
+        assert_eq!(s.end.as_deref(), Some(end));
+    }
 }

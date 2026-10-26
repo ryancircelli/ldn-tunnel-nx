@@ -7,6 +7,7 @@
     "test": "tsc --noEmit && vitest run",
     "coverage": "vitest run --coverage",
     "logs": "node --experimental-transform-types tools/logs.ts",
+    "drops": "node --experimental-transform-types tools/drops.ts",
     "release": "node --experimental-transform-types tools/release.ts",
     "promote": "node --experimental-transform-types tools/promote.ts",
     "status": "node --experimental-transform-types tools/update-status.ts",

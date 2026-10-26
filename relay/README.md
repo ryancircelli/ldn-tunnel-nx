@@ -157,6 +157,13 @@ These differences are deliberate. Everything else follows the C# handlers, inclu
 - Liveness: a Durable Object alarm every 10 s replaces the C# ping loop, with the same rules. A session
   idle for more than 10 s gets `Ping{requester=0}`, and one that has not answered by the next tick is closed.
   After the object wakes from hibernation, every session counts as idle once.
+- Resume (not in C#): Cloudflare cuts WebSockets under running games (edge restarts; the object restarting
+  drops them all). A player whose socket drops keeps its node, IP and game for `RESUME_GRACE_MS` (15 s,
+  expired on the 10 s alarm, so 15–25 s); the others see nothing. Its console reconnects and sends
+  `Resume` (0xC5: its old session id + the room id); the relay answers ProxyConfig + Connected with the
+  same node and IP. Only the same token can resume a node. Past the grace the player leaves as in C#
+  (a host's game closes). After a restart, stored games wait the same window for their consoles.
+  `RESUME_GRACE_MS=0` restores the C# behaviour.
 
 ## Self-host with Docker
 

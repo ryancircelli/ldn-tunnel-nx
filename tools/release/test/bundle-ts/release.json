@@ -1,0 +1,22 @@
+{
+  "version": "v0.0.0",
+  "build": 1700000000,
+  "assets": {
+    "exefs.nsp": {
+      "sha256": "31f8f3dbf2c202a7bdf1deee6ec54cdd168d3ae1b61e3e6817a51e62c7dc5fe5",
+      "size": 11
+    },
+    "ldn-tunnel.ovl": {
+      "sha256": "8add9cb428206f5896805afe968baf1fb95e2f65d6da792f8e721e006100fd59",
+      "size": 13
+    },
+    "manifest.bin": {
+      "sha256": "a7da66968d4d08b8477a73e88ac7f076d3d41b35f6df4da567417b42dc776993",
+      "size": 192
+    },
+    "relay-cloudflare.zip": {
+      "sha256": "5b7a2754b389130e138d57ba83f1eae7f05a41c66becacfa2dd2060143ae66db",
+      "size": 9
+    }
+  }
+}

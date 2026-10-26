@@ -1,6 +1,9 @@
 //! Remote log flush (port of `RyuLdnClient::send_remote_log`): lines drained from the
 //! [`LogRing`] become DebugLog (0xC0) packets `[u8 label_len][label][lines, \n-separated]`,
-//! at most [`MAX_PACKETS`] per [`INTERVAL_MS`].
+//! at most [`MAX_PACKETS`] per [`INTERVAL_MS`]. While a game holds the link
+//! ([`RemoteLog::set_game`]) the logs share the WebSocket with its packets, so they keep out
+//! of the way: one packet per [`GAME_INTERVAL_MS`], none while game packets wait to be sent.
+//! A forced flush (the session ends) sends the full budget.
 //!
 //! The ring is drained when a payload is built, so a payload that cannot be sent is lost
 //! (the C++ keeps a cursor and retries). Only flush while the connection is Ready.
@@ -14,6 +17,8 @@ use crate::logring::LogRing;
 pub const INTERVAL_MS: u64 = 500;
 /// Packets per interval.
 pub const MAX_PACKETS: u8 = 4;
+/// During a game: one packet (<= 2 KB) per this many ms, ~400 B/s at most.
+pub const GAME_INTERVAL_MS: u64 = 5000;
 /// The C++ packet buffer is 2000 bytes including the 12-byte header; the relay drops > 2048.
 pub const MAX_PAYLOAD: usize = 1988;
 pub const MAX_LABEL: usize = 32;
@@ -28,6 +33,9 @@ pub struct RemoteLog {
     last_ms: Option<u64>,
     sent: u8,
     active: bool,
+    game: bool,
+    /// In a game and its packets are queued: send nothing (unless forced).
+    hold: bool,
 }
 
 impl RemoteLog {
@@ -44,7 +52,14 @@ impl RemoteLog {
             l.clear();
             let _ = l.push_str("switch");
         }
-        Self { label: l, last_ms: None, sent: 0, active: false }
+        Self { label: l, last_ms: None, sent: 0, active: false, game: false, hold: false }
+    }
+
+    /// Before each flush: does a game hold the link (the session wants it), and is its send
+    /// queue empty.
+    pub fn set_game(&mut self, game: bool, queue_empty: bool) {
+        self.game = game;
+        self.hold = game && !queue_empty;
     }
 
     pub fn label(&self) -> &str {
@@ -57,15 +72,20 @@ impl RemoteLog {
     /// ignores the interval (the flush before a disconnect). `out` should be at least
     /// [`MIN_OUT`] bytes; at most [`MAX_PAYLOAD`] are used.
     pub fn next_payload(&mut self, ring: &mut LogRing, now_ms: u64, force: bool, out: &mut [u8]) -> Option<usize> {
+        let paced = self.game && !force;
+        if paced && self.hold {
+            return None;
+        }
+        let (interval, budget) = if paced { (GAME_INTERVAL_MS, 1) } else { (INTERVAL_MS, MAX_PACKETS) };
         if !self.active {
-            if !force && self.last_ms.is_some_and(|l| now_ms.saturating_sub(l) < INTERVAL_MS) {
+            if !force && self.last_ms.is_some_and(|l| now_ms.saturating_sub(l) < interval) {
                 return None;
             }
             self.active = true;
             self.sent = 0;
             self.last_ms = Some(now_ms);
         }
-        if self.sent >= MAX_PACKETS || ring.is_empty() {
+        if self.sent >= budget || ring.is_empty() {
             self.active = false;
             return None;
         }
@@ -165,6 +185,41 @@ mod tests {
         assert!(rl.next_payload(&mut ring, 7, true, &mut out).is_some()); // force
         ring.push("more");
         assert!(rl.next_payload(&mut ring, 8, false, &mut out).is_some()); // window still open
+    }
+
+    #[test]
+    fn game_pacing() {
+        let mut ring = LogRing::new();
+        let mut rl = RemoteLog::new("x");
+        let mut out = [0u8; 2048];
+        for i in 0..60 {
+            ring.push(&format!("{i:03}{}", "z".repeat(240)));
+        }
+        rl.set_game(true, false); // game packets queued: nothing
+        assert_eq!(rl.next_payload(&mut ring, 1000, false, &mut out), None);
+        rl.set_game(true, true);
+        assert!(rl.next_payload(&mut ring, 1000, false, &mut out).is_some());
+        assert_eq!(rl.next_payload(&mut ring, 1000, false, &mut out), None); // one per window
+        assert_eq!(rl.next_payload(&mut ring, 5999, false, &mut out), None);
+        assert!(rl.next_payload(&mut ring, 6000, false, &mut out).is_some());
+        assert_eq!(rl.next_payload(&mut ring, 6000, false, &mut out), None);
+        // the session ends: forced, full budget even with a queue
+        rl.set_game(true, false);
+        let mut n = 0;
+        while rl.next_payload(&mut ring, 6001, true, &mut out).is_some() {
+            n += 1;
+        }
+        assert_eq!(n, MAX_PACKETS);
+        // no game: back to 4 per 500 ms
+        for i in 0..40 {
+            ring.push(&format!("{i:03}{}", "z".repeat(240)));
+        }
+        rl.set_game(false, false);
+        let mut n = 0;
+        while rl.next_payload(&mut ring, 6600, false, &mut out).is_some() {
+            n += 1;
+        }
+        assert_eq!(n, MAX_PACKETS);
     }
 
     #[test]

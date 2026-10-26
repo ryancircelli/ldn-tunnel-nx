@@ -30,7 +30,7 @@ jobs:
             .
             crates/tls
             crates/ipc-tests
-      - run: make test-core test-tls test-ipc
+      - run: make test-core test-overlay test-tls test-ipc test-release
       - run: make lint-host
 
   # The Horizon module: clippy, the build, then the binary gates (stack frames, exefs size).
@@ -57,17 +57,27 @@ jobs:
       - run: make nsp
       - run: make check
 
+  # The Rust half (crates/overlay) builds with the host's cargo, the C++ in the devkitpro image.
   overlay:
     runs-on: ubuntu-latest
-    container: devkitpro/devkita64
     defaults:
       run:
         shell: bash # -eo pipefail: a failed make fails the step through the tee
     steps:
       - uses: actions/checkout@v4
-      - run: make -C overlay -j"$(nproc)" 2>&1 | tee build.log
+      - name: Toolchain (rust-toolchain.toml, with aarch64-unknown-none)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cbindgen@0.29.4
+      - name: The committed C header matches crates/overlay (else run make overlay-header)
+        run: make overlay-header && git diff --exit-code crates/overlay/include
+      - run: make overlay-rs
+      - run: docker run --rm -v "$PWD":/work -w /work/overlay devkitpro/devkita64 make -j"$(nproc)" 2>&1 | tee build.log
       - name: No compiler warnings (the overlay builds clean today)
         run: "! grep -n 'warning:' build.log"
+      - run: ls -l overlay/ldn-tunnel.ovl
 
   relay:
     runs-on: ubuntu-latest
@@ -148,15 +158,6 @@ jobs:
           cache-dependency-path: relay/package-lock.json
       - run: npm ci
       - run: npm run test:e2e-docker
-
-  release-tools:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - run: make test-release
 
   licenses:
     runs-on: ubuntu-latest

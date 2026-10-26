@@ -120,9 +120,12 @@ impl Console {
                         relay.close(l);
                     }
                     if !core::mem::take(&mut self.closing) {
-                        // lost, or never came up: tell the session; the room is gone with the link
+                        // lost, or never came up: tell the session; a room is resumed on a new link,
+                        // anything else is gone with this one
                         self.session.on_relay_closed(now);
-                        self.router.reset();
+                        if !self.session.is_resuming() {
+                            self.router.reset();
+                        }
                         self.wants_link = false;
                         self.drain_session(relay, now);
                     }
@@ -201,6 +204,8 @@ impl Console {
     pub fn sendto(&mut self, relay: &mut Relay, fd: i32, data: &[u8], ip: u32, port: u16) -> i32 {
         let dest = SockAddrIn::from_ryujinx(ip, port);
         match self.router.on_sendto(Self::key(fd), data, Some(&dest)) {
+            // the room is being resumed: dropped, as a lossy network would
+            Decision::Emit { payload, .. } if self.session.is_resuming() => payload.len() as i32,
             Decision::Emit { header, payload } => {
                 let mut msg = header.as_bytes().to_vec();
                 msg.extend_from_slice(payload);

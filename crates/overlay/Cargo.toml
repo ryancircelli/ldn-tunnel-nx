@@ -1,0 +1,31 @@
+[package]
+name = "ldn-tunnel-overlay"
+description = "Logic of the ldn-tunnel Tesla overlay (ldnt:cfg client, status texts, auto-save, restart sequence), linked into the C++ overlay as a staticlib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# A plain rlib (host tests, crates/ipc-tests); `make overlay-rs` builds the staticlib with
+# `cargo rustc --crate-type staticlib`: with an rlib next to it cargo would skip LTO.
+doctest = false
+
+[dependencies]
+heapless = { version = "0.9.3", default-features = false }
+ldn-tunnel-core = { path = "../core" }
+zerocopy = { version = "0.8", features = ["derive"] }
+
+# The workspace lints, except unsafe_code: deny, not forbid, so src/ffi.rs (the C ABI) may allow it.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+indexing_slicing = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+arithmetic_side_effects = "warn"

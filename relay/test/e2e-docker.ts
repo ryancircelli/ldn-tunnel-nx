@@ -34,7 +34,7 @@ async function step<T>(name: string, f: () => Promise<T>): Promise<T> {
   console.log(`ok - ${name} (${Date.now() - t} ms)`);
   return r;
 }
-const release = (...a: string[]) => sh("node", ["--experimental-strip-types", "--disable-warning=ExperimentalWarning", join(repo, "tools/release/release.ts"), ...a], { quiet: true });
+const release = (...a: string[]) => sh("cargo", ["run", "-q", "-p", "ldn-tunnel-release", "--manifest-path", join(repo, "Cargo.toml"), "--", ...a], { quiet: true });
 
 const cleanup = () => {
   const cv = ["relay-data", "caddy-data", "caddy-config"].map((v) => `${CADDY}_${v}`);

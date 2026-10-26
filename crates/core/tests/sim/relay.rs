@@ -105,13 +105,19 @@ impl Relay {
         core::mem::take(&mut self.peers[link].out)
     }
 
-    /// The transport died (or the console closed it).
+    /// The transport died (or the console closed it). A player keeps its node for the grace
+    /// window (relay.ts `RESUME_GRACE_MS`) until [`Relay::expire`] or a Resume.
     pub fn close(&mut self, link: usize) {
-        if !self.peers[link].open {
-            return;
-        }
-        self.disconnect_from_game(link);
         self.peers[link].open = false;
+    }
+
+    /// The grace window is over: players whose transport is gone leave their games.
+    pub fn expire(&mut self) {
+        for link in 0..self.peers.len() {
+            if !self.peers[link].open {
+                self.disconnect_from_game(link);
+            }
+        }
     }
 
     /// The relay's idle ping (relay.ts `alarm`): requester 0, echoed by the console.
@@ -197,6 +203,7 @@ impl Relay {
             }
             PacketId::Scan => self.scan(link, payload),
             PacketId::Disconnect if payload.len() >= 4 => self.disconnect_from_game(link),
+            PacketId::Resume => self.resume(link, payload),
             PacketId::ProxyData if in_game => self.route(link, payload),
             _ => {} // Passphrase, Ping, DebugLog, ...
         }
@@ -334,6 +341,34 @@ impl Relay {
                 self.send(p, PacketId::Disconnect.raw(), &[0; 4]);
             }
         }
+    }
+
+    /// relay.ts resume: the new link takes over the old link's node (same IP), if its game is open.
+    fn resume(&mut self, link: usize, payload: &[u8]) {
+        let (Some(old), Some(room)) = (payload.get(..16), payload.get(16..32)) else { return };
+        let found = (0..self.peers.len()).find(|&o| {
+            let p = &self.peers[o];
+            o != link && p.init && p.sid == old && p.game.is_some_and(|g| {
+                !self.games[g].closed && self.games[g].info.network_id.session_id.data == room
+            })
+        });
+        let Some(o) = found else { return self.error(link, NetworkErrorCode::ConnectNotFound) };
+        self.peers[o].open = false; // a stale socket the relay had not seen close yet
+        let g = self.peers[o].game.take().unwrap();
+        let ip = self.peers[o].ip;
+        self.peers[link].ip = ip;
+        self.peers[link].game = Some(g);
+        let game = &mut self.games[g];
+        for p in game.players.iter_mut().filter(|p| **p == o) {
+            *p = link;
+        }
+        if game.owner == o {
+            game.owner = link;
+        }
+        let cfg = ProxyConfig { proxy_ip: ip, proxy_subnet_mask: NETWORK_MASK };
+        self.send(link, PacketId::ProxyConfig.raw(), cfg.as_bytes());
+        let info = self.games[g].info;
+        self.send(link, PacketId::Connected.raw(), info.as_bytes());
     }
 
     /// HostedGame.RouteMessage (unicast and broadcast; a broadcast includes the sender).

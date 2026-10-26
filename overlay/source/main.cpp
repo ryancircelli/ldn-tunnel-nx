@@ -2,8 +2,8 @@
  * @file main.cpp
  * @brief Entry point for the ldn-tunnel Tesla Overlay.
  *
- * Initializes the ldnt:cfg IPC service, queries the sysmodule version,
- * and loads the MainDashboardGui as the initial screen.
+ * Opens ldnt:cfg and reads the module version (crates/overlay, ldnt_init), then loads the
+ * MainDashboardGui as the initial screen.
  *
  * @copyright Copyright (c) 2026 ldn-tunnel contributors
  * @license GPL-2.0-or-later
@@ -11,40 +11,24 @@
 
 #define TESLA_INIT_IMPL
 #include <tesla.hpp>
-#include "ldn_tunnel_ipc.h"
-#include "app/config_actions.hpp"
-#include "app/overlay_state.hpp"
+#include "ldn_tunnel_overlay.h"
 #include "views/connection/main_dashboard_gui.hpp"
 
 class LdnTunnelOverlay : public tsl::Overlay {
 public:
     virtual void initServices() override {
-        auto& state = OverlayState::Instance();
-        state.SetStatus(OverlayState::InitStatus::Uninit);
         tsl::hlp::doWithSmSession([&] {
-            Result rc = ldnTunnelInitialize();
-            if (R_FAILED(rc)) { state.SetStatus(OverlayState::InitStatus::Error); return; }
-            LdnTunnelConfigService* svc = ldnTunnelGetService();
-            if (svc) {
-                char version[32];
-                rc = ldnTunnelGetVersion(svc, version);
-                state.SetVersion(R_SUCCEEDED(rc) ? version : "Unknown");
-            }
-            state.SetStatus(OverlayState::InitStatus::Loaded);
+            ldnt_init();
             // Best effort: only feeds the "No internet" hint
-            m_nifm = R_SUCCEEDED(nifmInitialize(NifmServiceType_User));
+            if (ldnt_status() == LdntInit_Loaded) m_nifm = R_SUCCEEDED(nifmInitialize(NifmServiceType_User));
         });
-
     }
     virtual void exitServices() override {
         if (m_nifm) nifmExit();
-        if (OverlayState::Instance().GetStatus() == OverlayState::InitStatus::Loaded) {
-            SaveIfDirty();  // closing the overlay must not lose changes
-            ldnTunnelExit();
-        }
+        ldnt_exit();  // closing the overlay must not lose changes
     }
     virtual void onShow() override {}
-    virtual void onHide() override { SaveIfDirty(); }
+    virtual void onHide() override { ldnt_save_if_dirty(); }
     virtual std::unique_ptr<tsl::Gui> loadInitialGui() override {
         return initially<MainDashboardGui>();
     }

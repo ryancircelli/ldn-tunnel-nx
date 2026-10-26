@@ -15,12 +15,13 @@ cd relay && npm ci && cd ..
 
 | command | what it runs |
 |---|---|
-| `make test` | every host test suite: `test-core` (crates/core, then again optimised with overflow checks), `test-tls`, `test-ipc` (crates/ipc-tests: the IPC message layouts nx sends and serves, against libnx and Atmosphere), `test-release` (tools/release), `test-relay` (relay typecheck, vitest on workerd and Node, the hw-check unit test) |
-| `make lint` | clippy `-D warnings`: `lint-host` (core, tls) and `lint-sys` (the module, with its deny lints) |
+| `make test` | every host test suite: `test-core` (crates/core, then again optimised with overflow checks), `test-overlay` (crates/overlay: the overlay's status texts, auto-save and restart sequence against a fake module and pm), `test-tls`, `test-ipc` (crates/ipc-tests: the IPC message layouts nx sends and serves, against libnx and Atmosphere; the overlay's ldnt:cfg client against the module's server), `test-release` (tools/release: the signing tool through its binary, the TypeScript tool's bytes as goldens, the console's verifier on its output), `test-relay` (relay typecheck, vitest on workerd and Node, the hw-check unit test) |
+| `make lint` | clippy `-D warnings`: `lint-host` (core, overlay for the host and for `aarch64-unknown-none`, tls) and `lint-sys` (the module, with its deny lints) |
 | `make nsp` | builds the module: `crates/sys/target/.../release/ldn-tunnel` (ELF) and `ldn-tunnel.nsp` |
 | `make check` | the binary gates below, on what `make nsp` built |
 | `cd relay && npm run test:e2e-docker` | the relay's Docker image through `docker run` and the real `docker-compose.yml` + Caddy (needs Docker with compose v2.24 or later, about 2 minutes) |
-| `docker run --rm -v $PWD:/repo -w /repo devkitpro/devkita64 make -C overlay` | the overlay |
+| `make overlay-rs && docker run --rm -v $PWD:/repo -w /repo devkitpro/devkita64 make -C overlay` | the overlay: its Rust half (crates/overlay) as a staticlib with the host's cargo (the image has none), then the C++ in the image |
+| `make overlay-header` | regenerates `crates/overlay/include/ldn_tunnel_overlay.h` after a change to the overlay's C API (`cargo install cbindgen --locked`) |
 
 Any single suite runs on its own, e.g. `make test-core`. A new suite is a Makefile target plus its
 name in `TESTS`.
@@ -29,18 +30,19 @@ name in `TESTS`.
 
 `.github/workflows/ci.yml` runs on every push and pull request. Every job must pass:
 
-- **rust**: `make test-core test-tls test-ipc` and `make lint-host`.
+- **rust**: `make test-core test-overlay test-tls test-ipc test-release` and `make lint-host`.
 - **module**: `make lint-sys`, `make nsp`, `make check`.
-- **overlay**: builds in `devkitpro/devkita64` and fails on any compiler warning.
+- **overlay**: fails when `crates/overlay/include/ldn_tunnel_overlay.h` is stale (`make overlay-header`),
+  builds the staticlib (`make overlay-rs`), then the overlay in `devkitpro/devkita64`; fails on any
+  compiler warning. Prints the `.ovl` size.
 - **relay**: `npm ci` and `make test-relay`.
 - **relay-docker**: `npm run test:e2e-docker`.
-- **release-tools**: `make test-release`.
 - **licenses**: `cargo deny check licenses` for the three Rust trees.
 - **coverage**: `make coverage` (below); on `main` the **badges** job puts the numbers on the `badges` branch for the README.
 
 ### Binary gates (`make check`, `tools/check-elf.sh`)
 
-Two kinds of failure only show up on a console, so the gates check the built binary for them:
+Three kinds of failure only show up on a console, so the gates check the built binary for them:
 
 - **Stack frames.** No function may have a stack frame over `FRAME_MAX` (8 KiB). The module's threads
   have 16 to 32 KiB stacks, and the stack does not grow. A 16 KiB buffer on the stack once made a 32 KiB
@@ -49,8 +51,13 @@ Two kinds of failure only show up on a console, so the gates check the built bin
   prints the 10 largest frames. When this gate fails, move the buffer to the heap (`Box`) or into
   a `static`.
 - **Size.** `exefs.nsp` may be at most `NSP_MAX` bytes (768 KiB).
+- **Static memory.** The loaded image through the end of `.bss` (which holds the 1 MiB heap and the
+  128 KiB bsd transfer memory), page-rounded, plus `main_thread_stack_size` from `crates/sys/main.json`
+  may be at most `MEM_MAX` bytes (2.5 MiB). Atmosphere gives all custom sysmodules about 32 MiB
+  together. On the console the `mem: heap high=<n> of <heap> proc=<used> of <total>` log line shows the
+  real figures: `proc` runs a few pages above this static figure.
 
-Both limits are environment variables, e.g. `FRAME_MAX=16384 make check`. Raising one belongs in its
+All limits are environment variables, e.g. `FRAME_MAX=16384 make check`. Raising one belongs in its
 own commit that says why. `tools/check-elf.sh --self-test` checks the frame parser against small
 functions compiled with `llc`.
 

@@ -34,6 +34,7 @@ use core::sync::atomic::Ordering::Relaxed;
 use embedded_io::{Read as _, Write as _};
 use ldn_tunnel_core::cfg_types::ConnectionStatus;
 use ldn_tunnel_core::config::Server;
+use ldn_tunnel_core::conn::drop_stats::{self, LinkStats};
 use ldn_tunnel_core::conn::remote_log::{self, RemoteLog};
 use ldn_tunnel_core::conn::update_dl::{self, CHUNK_HEADER, Progress, State as Dl, UpdateDl};
 use ldn_tunnel_core::conn::{Action, Conn, ConnConfig, ConnectionState, Failure, Session};
@@ -86,6 +87,7 @@ struct Link {
     /// Staging for one outbox payload / one remote-log payload.
     payload: [u8; outbox::PAYLOAD_MAX],
     remote: RemoteLog,
+    stats: Option<LinkStats>,
 }
 
 static LINK: Mutex<Option<Link>> = Mutex::new(None);
@@ -105,6 +107,7 @@ pub fn start() -> nx::result::Result<JoinHandle<()>> {
         out: [0; OUT_CAP],
         payload: [0; outbox::PAYLOAD_MAX],
         remote: RemoteLog::new(""),
+        stats: None,
     });
     Builder::new()
         .name("relay-tx")
@@ -199,8 +202,8 @@ struct Relay {
     seq: u32,
     /// The session wants the link and has not been told it is up (sim `wants_link`).
     wanted: bool,
-    /// We closed the link ourselves: its Drop is not a loss (sim `closing`).
-    closing: bool,
+    /// We closed the link ourselves, and why: its Drop is not a loss (sim `closing`).
+    closing: Option<&'static str>,
     /// Last Ready edge toasted.
     up: bool,
     /// Last state logged by `edges`.
@@ -242,7 +245,7 @@ impl Relay {
             shown: (ConnectionStatus::Disconnected, ConnectionState::Disconnected),
             seq: 0, // RELAY_SEQ starts at 0: any request made before this thread counts
             wanted: false,
-            closing: false,
+            closing: None,
             up: false,
             last: ConnectionState::Disconnected,
             why: "",
@@ -337,7 +340,7 @@ impl Relay {
                 self.wanted = want;
             } else {
                 self.own_link = false;
-                self.closing = true;
+                self.closing = Some(if want { "session asked for a new link" } else { "the session ended" });
                 l.conn.close();
                 if let Some(next) = self.drive(l, now) {
                     return next;
@@ -352,6 +355,7 @@ impl Relay {
             return next;
         }
         flush_outbox(l);
+        l.remote.set_game(want, outbox::is_empty());
         self.flush_log(l, now, false);
         self.status(l);
         if self.wanted
@@ -361,10 +365,10 @@ impl Relay {
             self.wanted = false;
             return Next::Ready(s);
         }
-        if !want && !self.wanted && !self.own_link && !self.closing && l.conn.is_ready() {
+        if !want && !self.wanted && !self.own_link && self.closing.is_none() && l.conn.is_ready() {
             // A retry came up after the session gave the link up: nobody needs it.
             log!(Verbose, "relay: link up but not wanted, closed");
-            self.closing = true;
+            self.closing = Some("link up but not wanted");
             l.conn.close();
         }
         self.update_link(l, now, want);
@@ -398,16 +402,17 @@ impl Relay {
                     }
                 }
                 Action::Drop => {
+                    log_link_end(l, self.closing, now);
                     l.tls = None; // closes the socket
                     (self.pos, self.len) = (0, 0);
-                    if core::mem::take(&mut self.closing) {
-                        log!(Verbose, "relay: link closed");
+                    if let Some(why) = self.closing.take() {
+                        log!(Info, "relay: link closed: {why}");
                     } else if self.own_link {
                         // The check's own link: no retries, the overlay shows the failure.
                         log!(Warning, "update: relay not reachable for the check ({:?})", l.conn.failure());
                         self.own_link = false;
                         self.abort_update(true);
-                        self.closing = true;
+                        self.closing = Some("update check link failed");
                         l.conn.close(); // cancels the backoff; ends in a quiet Drop
                     } else {
                         match l.conn.failure() {
@@ -445,6 +450,7 @@ impl Relay {
         match l.conn.opened(&server.host, server.port, &server.path, &server.token, &key, &mut l.out) {
             Ok(n) => {
                 if write(&mut l.conn, &mut tls, l.out.get(..n).unwrap_or_default()) {
+                    l.stats = Some(LinkStats::new(uptime_ms()));
                     l.tls = Some((tls, fd));
                 }
             }
@@ -478,7 +484,12 @@ impl Relay {
                     l.conn.transport_lost();
                     return None;
                 }
-                Ok(n) => (self.pos, self.len) = (0, n),
+                Ok(n) => {
+                    if let Some(s) = l.stats.as_mut() {
+                        s.on_rx(self.rx.get(..n).unwrap_or_default());
+                    }
+                    (self.pos, self.len) = (0, n);
+                }
                 // Nothing more buffered (read timeout 0): wait for the socket again.
                 Err(ldn_tunnel_tls::Error::Io(NetError::TimedOut)) => return None,
                 Err(e) => {
@@ -492,7 +503,7 @@ impl Relay {
 
     /// DebugLog (0xC0) packets from the remote-log ring while Ready.
     fn flush_log(&mut self, l: &mut Link, now: u64, force: bool) {
-        let Link { conn, tls: Some((tls, _)), remote, out, payload } = l else { return };
+        let Link { conn, tls: Some((tls, _)), remote, out, payload, .. } = l else { return };
         if !conn.is_ready() {
             return;
         }
@@ -539,7 +550,7 @@ impl Relay {
         }
         self.last = state;
         match state {
-            ConnectionState::Connected => log!(Info, "ws: upgrade 101"),
+            ConnectionState::Connected => log!(Info, "ws: upgrade 101, ray {}", l.stats.as_ref().map_or("-", LinkStats::ray)),
             ConnectionState::Handshaking => log!(Info, "relay: Initialize sent"),
             ConnectionState::Ready => {
                 let id = l.conn.session().map(|s| s.id).unwrap_or_default();
@@ -585,7 +596,7 @@ impl Relay {
     /// Under `LINK`, every pass: start a due check, request the next chunk, time out, and
     /// bring a link up for (or close it after) a manual check.
     fn update_link(&mut self, l: &mut Link, now: u64, want: bool) {
-        let ready = l.conn.is_ready() && !self.closing;
+        let ready = l.conn.is_ready() && self.closing.is_none();
         if matches!(self.dl.state(), Dl::AwaitManifest | Dl::Downloading) && !ready {
             self.abort_update(false); // the link went: resume on the next one
         }
@@ -605,9 +616,9 @@ impl Relay {
             log!(Info, "update: connecting to the relay for the check");
             l.conn.connect(now);
         }
-        if self.own_link && ready && !self.check_due && !self.dl_busy() && !self.closing {
+        if self.own_link && ready && !self.check_due && !self.dl_busy() && self.closing.is_none() {
             self.own_link = false;
-            self.closing = true;
+            self.closing = Some("update check done");
             l.conn.close();
         }
         self.report();
@@ -791,4 +802,21 @@ fn read_ca(path: &str) -> Result<Vec<u8>, &'static str> {
             Err("CA file missing")
         }
     }
+}
+
+/// The one line that says who ended a link (`core::conn::drop_stats`).
+fn log_link_end(l: &mut Link, closing: Option<&str>, now: u64) {
+    let Some(s) = l.stats.take() else { return };
+    let t = l.tls.as_ref().map(|(t, _)| t.stats());
+    let (last_rx_ms, last_tx_ms) = l.conn.last_io_ms();
+    let io = drop_stats::Io {
+        rx_bytes: t.map_or(0, |t| t.rx_bytes),
+        tx_bytes: t.map_or(0, |t| t.tx_bytes),
+        reads: t.map_or(0, |t| t.reads),
+        writes: t.map_or(0, |t| t.writes),
+        last_rx_ms,
+        last_tx_ms,
+        tls_end: t.and_then(|t| t.end.as_deref()),
+    };
+    log!(Info, "{}", s.ended(now, closing, l.conn.failure(), io));
 }

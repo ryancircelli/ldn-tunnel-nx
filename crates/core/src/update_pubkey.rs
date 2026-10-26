@@ -17,7 +17,7 @@ pub const PUBLISHER_PUBKEY: [u8; 65] = [
 mod tests {
     use crate::update::{ManifestResult, check_manifest};
 
-    /// Produced by `tools/release/release.ts sign-manifest` with the fixture key (build 2).
+    /// Produced by the old TypeScript `release.ts sign-manifest` with the fixture key (build 2).
     /// Pins the TypeScript signer to the Rust verifier; independent of PUBLISHER_PUBKEY.
     const FIXTURE_MANIFEST: &[u8] = include_bytes!("../../../tools/release/test/fixture-manifest.bin");
     const FIXTURE_PUBKEY: [u8; 65] = *include_bytes!("../../../tools/release/test/fixture-pubkey.bin");

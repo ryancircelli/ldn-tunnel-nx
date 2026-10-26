@@ -21,7 +21,7 @@ const sha = (b: Uint8Array) => createHash("sha256").update(b).digest();
 const bytes = (n: number, seed: number) => Uint8Array.from({ length: n }, (_, i) => (i * 31 + seed) & 0xff);
 const p1363 = (b: Uint8Array) => new Uint8Array(sign("sha256", b, { key: e.TEST_PUBLISHER_PRIVATE_PEM, dsaEncoding: "ieee-p1363" }));
 
-/** A signed release as CI publishes it (tools/release/release.ts: version = the tag): asset name -> bytes. */
+/** A signed release as CI publishes it (tools/release: version = the tag): asset name -> bytes. */
 function makeRelease(semver: string, seed: number) {
   const version = "v" + semver;
   const exefs = bytes(70_000 + seed, seed), overlay = bytes(3000 + seed, seed + 1);
@@ -111,7 +111,7 @@ async function redeem(token: string) {
   const ini = dec.decode(files["config/ldn-tunnel/config.ini"]);
   return { files, ini, token: ini.match(/^token = ([0-9a-f]{64})$/m)![1] };
 }
-async function connect(token: string): Promise<{ status: number; c?: Ldn }> {
+async function connect(token: string): Promise<{ status: number; c?: Ldn; ws?: WebSocket }> {
   const res = await req("/ldn", { headers: { Upgrade: "websocket", Authorization: `Bearer ${token}` } });
   if (res.status !== 101) return { status: res.status };
   const ws = res.webSocket!;
@@ -120,7 +120,7 @@ async function connect(token: string): Promise<{ status: number; c?: Ldn }> {
   const c = new Ldn((b) => ws.send(b));
   ws.addEventListener("message", (ev) => c.push(new Uint8Array(ev.data as ArrayBuffer)));
   ws.addEventListener("close", () => c.end());
-  return { status: 101, c };
+  return { status: 101, c, ws };
 }
 const updateCheck = (module: number, version = "v-running", build = 5) => UpdateCheckRequest.encode({
   running_build: build, rejected_build: 0, channel: 1, label_len: 4, reserved: new Uint8Array([module, 0]),
@@ -348,6 +348,42 @@ describe("invites and console tokens", () => {
     await expect(c!.next()).rejects.toThrow("closed");
     expect((await connect(token)).status).toBe(404);
     expect((await apiJson(`/api/consoles/${row.id}/revoke`, "POST")).status).toBe(404);
+  });
+});
+
+describe("drops", () => {
+  const drops = async (who: string) => (await apiJson("/api/drops")).body.filter((d: any) => d.who === who);
+  const waitDrops = async (who: string, n: number) => {
+    for (let i = 0; i < 50; i++) {
+      const rows = await drops(who);
+      if (rows.length >= n) return rows;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    throw new Error("no drop row");
+  };
+
+  it("records who ended each socket, with its traffic, in /api/drops", async () => {
+    const { token } = await redeem(await invite("Drop-1"));
+    const who = "c:" + (await consoleOf("Drop-1")).id;
+    const a = await connect(token);
+    a.c!.send(PacketId.UpdateCheck, updateCheck(1));
+    await a.c!.expect(PacketId.UpdateManifest);
+    a.c!.send(PacketId.DebugLog, new Uint8Array([1, 120, ...enc.encode("hi")]));
+    await a.c!.none(50);
+    a.ws!.close(4001, "bye");
+    const [peer] = await waitDrops(who, 1);
+    expect(peer).toMatchObject({ ev: "drop", by: "peer", code: 4001, reason: "bye", frames_in: 2 });
+    expect(peer.frames_out).toBeGreaterThanOrEqual(1);
+    expect(peer.idle_in_ms).toBeGreaterThanOrEqual(0);
+    expect(peer.age_s).toBe(0);
+    expect(Date.parse(peer.do_start)).toBeLessThanOrEqual(Date.parse(peer.at));
+
+    const b = await connect(token);
+    expect((await apiJson(`/api/consoles/${who.slice(2)}/revoke`, "POST")).status).toBe(200);
+    await expect(b.c!.next()).rejects.toThrow("closed");
+    const [relay] = await waitDrops(who, 2); // newest first
+    expect(relay).toMatchObject({ by: "relay", code: 1000, reason: "revoked", frames_in: 0, frames_out: 0, idle_in_ms: null });
+    expect((await apiJson("/api/drops")).body.some((d: any) => d.ev === "relay-start")).toBe(true);
   });
 });
 

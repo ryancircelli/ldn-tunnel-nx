@@ -60,12 +60,12 @@ keys, such as `migrations`, are ignored. A version upload cannot run migrations 
 
 The private key is the GitHub Actions secret `PUBLISHER_KEY`. Its public half is committed as
 `relay/src/core/publisher_key.ts`, the single source for both the relay and the console. The signing tool
-is `tools/release/release.ts` (`sign-manifest`, `release-json`, `verify`). No workflow deploys a relay.
+is `tools/release` (Rust, package `ldn-tunnel-release`: `gen-key`, `sign-manifest`, `release-json`, `verify`). No workflow deploys a relay.
 
 1. **Check the pin:** `relay/release.json` must be `{repo: <this repository>, tag: <the pushed tag>}`.
 2. **Build the module** with `LDNT_UPDATE_PUBKEY` = the point in `publisher_key.ts` (refused if it is the
    test fixture), `LDNT_VERSION` = the tag and `LDNT_BUILD` = the run's unix time; `make nsp`.
-3. **Build the overlay** (`make -C overlay` in `devkitpro/devkita64`) and **the Worker**
+3. **Build the overlay** (`make overlay-rs`, then `make -C overlay` in `devkitpro/devkita64`) and **the Worker**
    (`cd relay && npm ci && npm test && npm run bundle -- --out relay-cloudflare.zip`). Use the bundle script,
    not a hand-made zip: Wrangler names the entry module `worker.js` and the two text modules must be in it.
 4. **Sign:** `sign-manifest --build <LDNT_BUILD of step 2>` (format 2) → `manifest.bin`; then

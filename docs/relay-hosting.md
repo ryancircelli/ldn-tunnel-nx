@@ -132,8 +132,17 @@ Checked on 2026-10-26 with Docker 27.2 / Compose 2.29 (`npm run test:e2e-docker`
 - `tls internal` / `localhost`: the root is `caddy/pki/authorities/local/root.crt` inside the `caddy-data` volume
   (`docker compose cp caddy:/data/caddy/pki/authorities/local/root.crt .`). A TLS client given only the kit's
   `ca.pem` fails with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`; with the root appended it verifies.
-- Public domain: the kit's `ca.pem` has ISRG Root X1 (Let's Encrypt), so Caddy's default certificate verifies.
-  *Inferred:* Caddy falls back to ZeroSSL if Let's Encrypt refuses, and that root is not in `ca.pem`.
+- Public domain (checked 2026-10-26: `ghcr.io/ryancircelli/ldn-tunnel-relay:v0.1.0`, the shipped compose file and
+  Caddyfile, a real hostname). Let's Encrypt issued over HTTP-01. Caddy serves leaf ← `YE1` ← `Root YE` ←
+  `ISRG Root X2` ← `ISRG Root X1` (cross-signs). With ISRG Root X1 as the only trusted root, the chain verifies
+  in `openssl s_client -verify_return_error -verify_hostname` and in the console's TLS crate
+  (`crates/tls`, rustls-webpki). The kit's `ca.pem` holds X1 among its roots. It has no ZeroSSL root, so the
+  Caddyfile pins `acme_ca` to Let's Encrypt. *Inferred:* without that pin, Caddy can fall back to ZeroSSL.
+- Two desktop clients completed host, scan, join and ProxyData both ways over the internet
+  (`npm run test:e2e -- --url wss://<host>/ldn`). That run reached the box through a Cloudflare Tunnel, not
+  port forwarding. Cloudflare's edge terminates TLS with its own certificate, which `ca.pem` also trusts (GTS).
+  Behind a TLS-terminating proxy, TLS-ALPN-01 fails (`Cannot negotiate ALPN protocol "acme-tls/1"`) and
+  HTTP-01 must reach Caddy's port 80.
 - `TRUST_PROXY=1` behind Caddy: 13 wrong logins with a different client-sent `X-Forwarded-For` each are answered
   429 from the 12th, because Caddy replaces the header. Straight at the relay, `TRUST_PROXY=1` lets each of them
   count against a new address (no lockout), and without `TRUST_PROXY` the header is ignored (lockout). Hence the

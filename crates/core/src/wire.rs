@@ -65,7 +65,7 @@ macro_rules! wire_enum {
 }
 
 wire_enum! {
-    /// `LdnHeader.type`. 0xC0..=0xC4 are relay extensions (not in Ryujinx).
+    /// `LdnHeader.type`. 0xC0..=0xC5 are relay extensions (not in Ryujinx).
     PacketId: u8 {
         Initialize = 0,
         Passphrase = 1,
@@ -101,6 +101,10 @@ wire_enum! {
         UpdateChunk = 0xC3,
         /// Relay -> console: [`UpdateChunkHeader`] + data.
         UpdateChunkData = 0xC4,
+        /// Console -> relay, on a new link: the previous link's session id (16 bytes, from its
+        /// Initialize reply) + the room's `NetworkId.session_id` (16). The relay answers ProxyConfig +
+        /// Connected (back in the room, same node and IP) or NetworkError ConnectNotFound.
+        Resume = 0xC5,
         Ping = 254,
         NetworkError = 255,
     }

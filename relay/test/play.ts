@@ -253,6 +253,42 @@ export function playSuite(t: Target) {
     }
   });
 
+  describe("a station quits mid-race (hardware report: the host was thrown out)", () => {
+    for (const how of ["disconnect", "close"] as const) {
+      it(`as ldn-tunnel sends it (goodbye, ${how === "disconnect" ? "Disconnect twice, then close" : "socket close only"}): the host only sees the node leave and races on`, async () => {
+        const { players, lcid } = await room(t, 2);
+        const [h, s] = players;
+        for (let f = 0; f < 30; f++) {
+          send(h, BCAST, f);
+          send(s, h.ip, 100 + f);
+        }
+        const last = async (p: Player, n: number) => {
+          const v: number[] = [];
+          while (v.length < n) v.push((await p.c.expect(PacketId.ProxyData)).at(-1)!);
+          return v.sort((a, b) => a - b);
+        };
+        expect(await last(h, 60)).toEqual([...Array(30).keys(), ...Array.from({ length: 30 }, (_, f) => 100 + f)]);
+        expect(await last(s, 30)).toEqual([...Array(30).keys()]);
+        send(s, BCAST, 200); // the goodbye
+        if (how === "disconnect") {
+          s.c.send(PacketId.Disconnect, DisconnectMessage.encode({ disconnect_ip: 0 })); // Session::disconnect
+          s.c.send(PacketId.Disconnect, DisconnectMessage.encode({ disconnect_ip: 0 })); // Conn::close's own
+        }
+        s.c.close();
+        expect(await got(h, 200)).toEqual([200]);
+        roster(NetworkInfo.decode(await h.c.expect(PacketId.SyncNetwork)), [h]);
+        await h.c.none(); // no Disconnect, no NetworkError, no second SyncNetwork
+        send(h, BCAST, 201);
+        expect(await got(h, 201)).toEqual([201]);
+        const [seen] = await (await ready(t)).c.scanAll(lcid);
+        roster(seen, [h]);
+        players.pop();
+        const { info } = await join(t, seen, players); // the host gets the same SyncNetwork (checked in join)
+        roster(info, players);
+      });
+    }
+  });
+
   describe("routing", () => {
     it("broadcast reaches every player incl. the sender; unicast only its target; nothing crosses games", async () => {
       const lcid = freshLcid(); // two rooms of the same game, as two MK8D lobbies would be
@@ -550,5 +586,86 @@ export function playSuite(t: Target) {
       send(witness[1], BCAST, 5);
       for (const p of witness) expect(await got(p, 5)).toEqual([5]);
     });
+  });
+}
+
+/** Resume (Cloudflare cuts a console's WebSocket mid-race): the console comes back on a new socket. */
+export const resumeMsg = (oldSid: string, net: NetworkInfo) => {
+  const b = new Uint8Array(32);
+  b.set(Uint8Array.from(oldSid.match(/../g)!, (h) => parseInt(h, 16)));
+  b.set(net.network_id.session_id, 16);
+  return b;
+};
+
+/** Back on a new socket: Resume answers the old IP and the room; the player object is updated in place. */
+export async function resume(t: Target, p: Player, net: NetworkInfo) {
+  const { c, sid } = await ready(t);
+  c.send(PacketId.Resume, resumeMsg(p.sid, net));
+  expect(ProxyConfig.decode(await c.expect(PacketId.ProxyConfig)).proxy_ip).toBe(p.ip);
+  const info = NetworkInfo.decode(await c.expect(PacketId.Connected));
+  Object.assign(p, { c, sid });
+  return info;
+}
+
+/**
+ * Grace and resume, against a relay with RESUME_GRACE_MS on. `expire` ends the grace window of the waiting
+ * players now (the Durable Object test moves the clock; omitted where the target cannot).
+ */
+export function resumeSuite(t: Target, expire?: () => Promise<void>) {
+  describe("a dropped socket is resumed (Cloudflare cut the WebSocket mid-race)", () => {
+    for (const who of ["station", "host", "both"] as const) {
+      it(`${who}: the others see no change, the room and addresses stay, traffic flows again`, async () => {
+        const { players, net } = await room(t, 3);
+        const cut = who === "station" ? [players[1]] : who === "host" ? [players[0]] : players;
+        for (const p of cut) p.c.close();
+        const rest = players.filter((p) => !cut.includes(p));
+        for (const p of rest) await p.c.none(); // no SyncNetwork, no Disconnect
+        for (const p of cut) roster(await resume(t, p, net), players);
+        for (const p of players) await p.c.none(); // a resume is not a join: nobody gets a SyncNetwork
+        for (const [i, p] of players.entries()) {
+          send(p, BCAST, 10 + i);
+          for (const q of players) expect(await got(q, 10 + i)).toEqual([10 + i]);
+        }
+        // the host is still the owner: its leave closes the room for the stations
+        players[0].c.send(PacketId.Disconnect, DisconnectMessage.encode({ disconnect_ip: 0 }));
+        for (const p of players.slice(1)) {
+          roster(NetworkInfo.decode(await p.c.expect(PacketId.SyncNetwork)), players.slice(1));
+          await p.c.expect(PacketId.Disconnect);
+        }
+      });
+    }
+
+    it("only the node's own session id, its token and its room resume it; a resume of a live node ends the old socket", async () => {
+      const { players, net } = await room(t, 2);
+      const [, s] = players;
+      const other = await ready(t);
+      for (const bad of [resumeMsg(other.sid, net), resumeMsg(s.sid, NetworkInfo.zero()), new Uint8Array(31)]) {
+        const x = await ready(t);
+        x.c.send(PacketId.Resume, bad);
+        expect(err(await x.c.expect(PacketId.NetworkError))).toBe(NetworkError.ConnectNotFound);
+      }
+      const old = s.c;
+      roster(await resume(t, s, net), players); // the old socket was still open: the relay closes it
+      await expect(old.next()).rejects.toThrow("closed");
+      await players[0].c.none();
+    });
+
+    if (expire) {
+      it("past the grace window the node leaves as before and a late Resume is refused", async () => {
+        const { players, net } = await room(t, 3);
+        const [h, s, gone] = players;
+        gone.c.close();
+        await h.c.none();
+        await expire();
+        for (const p of [h, s]) roster(NetworkInfo.decode(await p.c.expect(PacketId.SyncNetwork)), [h, s]);
+        const late = await ready(t);
+        late.c.send(PacketId.Resume, resumeMsg(gone.sid, net));
+        expect(err(await late.c.expect(PacketId.NetworkError))).toBe(NetworkError.ConnectNotFound);
+        h.c.close();
+        await expire(); // the host does not come back either: its game closes for the station
+        roster(NetworkInfo.decode(await s.c.expect(PacketId.SyncNetwork)), [s]);
+        await s.c.expect(PacketId.Disconnect);
+      });
+    }
   });
 }

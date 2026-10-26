@@ -620,7 +620,7 @@ fn disconnect_reasons() {
     );
     assert_eq!(s.state(), CommState::AccessPoint);
 
-    // Host: the link dies (Ryujinx OnDisconnected).
+    // Host: the link dies (Ryujinx OnDisconnected) and the room is not resumed in time.
     let mut s = hosting();
     s.on_relay_closed(100);
     let out = drain(&mut s);
@@ -628,6 +628,9 @@ fn disconnect_reasons() {
         !has(&out, &Action::RelayDisconnect),
         "the shell already knows"
     );
+    assert_eq!(s.state(), CommState::AccessPointCreated, "resuming");
+    s.poll(100 + RESUME_MS);
+    assert!(has(&drain(&mut s), &Action::RelayDisconnect), "the reconnect attempt is dropped");
     assert_eq!(s.state(), CommState::AccessPoint);
     assert_eq!(
         s.get_disconnect_reason(),
@@ -1024,13 +1027,88 @@ fn scan_results_get_the_channel_fix() {
 fn virtual_ip_does_not_survive_a_reconnect() {
     let mut s = joined();
     s.on_relay_closed(10);
+    s.poll(10 + RESUME_MS); // not resumed: the room and the link are gone
     drain(&mut s);
     assert_eq!(s.get_ipv4_address(), None);
-    let Pending = s.scan(&ScanFilterFull::new_zeroed(), 20).unwrap();
+    let t = 20 + RESUME_MS;
+    let Pending = s.scan(&ScanFilterFull::new_zeroed(), t).unwrap();
     assert!(has(&drain(&mut s), &Action::RelayConnect));
-    s.on_relay_ready(30, [7; 16], [9; 6]);
+    s.on_relay_ready(t + 10, [7; 16], [9; 6]);
     drain(&mut s);
     assert_eq!(s.get_ipv4_address(), None, "nifm until a new ProxyConfig");
-    packet(&mut s, PacketId::ProxyConfig, &proxy_config(), 40);
+    packet(&mut s, PacketId::ProxyConfig, &proxy_config(), t + 20);
     assert_eq!(s.get_ipv4_address(), Some((MY_IP, MASK)));
+}
+
+// ---------------------------------------------------------------- resume
+
+/// The Resume a session sends on its new link: old link id (7s from `handshake`) + room id.
+fn resume_payload(room_id: [u8; 16]) -> StdVec<u8> {
+    let mut v = vec![7; 16];
+    v.extend_from_slice(&room_id);
+    v
+}
+
+/// The relay cut the link mid-race (hardware: Cloudflare closes the socket under us). The
+/// game sees nothing: same state, same IP, no StateChanged; the new link resumes the room.
+#[test]
+fn a_dropped_link_resumes_the_room_without_the_game_noticing() {
+    for host in [true, false] {
+        let mut s = if host { hosting() } else { joined() };
+        let state = s.state();
+        let room_id = s.network_info().network_id.session_id.data;
+        s.on_relay_closed(100);
+        let out = drain(&mut s);
+        assert!(has(&out, &Action::RelayConnect), "{out:?}");
+        assert!(!has(&out, &Action::StateChanged) && !has(&out, &Action::RelayDisconnect), "{out:?}");
+        assert!(s.is_resuming());
+        assert_eq!((s.state(), s.get_ipv4_address()), (state, Some((MY_IP, MASK))));
+        assert_eq!(s.next_deadline(), Some(100 + RESUME_MS));
+
+        // A failed attempt is retried within the same window.
+        s.on_relay_closed(300);
+        assert!(has(&drain(&mut s), &Action::RelayConnect));
+        assert_eq!(s.next_deadline(), Some(100 + RESUME_MS), "window not extended");
+
+        s.on_relay_ready(1500, [8; 16], [9; 6]);
+        assert_eq!(sends(&drain(&mut s)), [(PacketId::Resume, resume_payload(room_id))]);
+        packet(&mut s, PacketId::ProxyConfig, &proxy_config(), 1510);
+        let out = packet(&mut s, PacketId::Connected, room(&[OTHER_IP, MY_IP]).as_bytes(), 1520);
+        assert!(!has(&out, &Action::ReplyReady), "no request was pending");
+        assert!(!s.is_resuming());
+        assert_eq!(s.state(), state);
+        assert_eq!(s.get_disconnect_reason(), DisconnectReason::None);
+        s.poll(100 + RESUME_MS);
+        assert_eq!(s.state(), state, "the window is over");
+        // The next drop resumes against the new link's id.
+        s.on_relay_closed(2000);
+        s.on_relay_ready(2100, [9; 16], [9; 6]);
+        let resume = sends(&drain(&mut s));
+        assert_eq!(resume[0].1[..16], [8; 16]);
+    }
+}
+
+#[test]
+fn a_room_the_relay_no_longer_holds_is_lost() {
+    let mut s = joined();
+    s.on_relay_closed(100);
+    s.on_relay_ready(200, [8; 16], [9; 6]);
+    drain(&mut s);
+    let out = packet(&mut s, PacketId::NetworkError, &error(6), 210);
+    assert!(!s.is_resuming());
+    assert_eq!(s.state(), CommState::Station);
+    assert_eq!(s.get_disconnect_reason(), DisconnectReason::DestroyedByUser);
+    assert!(has(&out, &Action::RelayDisconnect), "proxies reset, as a plain link loss did");
+    assert_eq!(s.get_ipv4_address(), None);
+}
+
+#[test]
+fn leaving_during_a_resume_cancels_it() {
+    let mut s = joined();
+    s.on_relay_closed(100);
+    drain(&mut s);
+    s.disconnect(150).unwrap();
+    assert!(!s.is_resuming());
+    s.on_relay_ready(200, [8; 16], [9; 6]);
+    assert!(sends(&drain(&mut s)).is_empty(), "no Resume for a room we left");
 }

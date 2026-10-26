@@ -11,7 +11,7 @@ use ldn_tunnel_core::ldn::shell::launch_mode;
 use ldn_tunnel_core::ldn::{LdnError, NODE_COUNT_MAX, Pending, Session};
 use ldn_tunnel_core::ldn_types::{
     AddressList, ConnectNetworkData, ConnectPrivateData, CreateNetworkConfig,
-    CreateNetworkPrivateConfig, NetworkConfig, NetworkInfo, NodeLatestUpdate, ScanFilter,
+    CreateNetworkPrivateConfig, NetworkConfig, NetworkInfo, NodeLatestUpdate, NodeStateChange, ScanFilter,
     SecurityParameter,
 };
 use ldn_tunnel_core::notify::{Event, LdnMode};
@@ -161,6 +161,7 @@ impl ISessionObject for CommunicationService {
 impl Drop for CommunicationService {
     /// The game closed the service (or exited): its session goes.
     fn drop(&mut self) {
+        log!(Info, "ldn: game closed its ldn:u service (pid {})", self.pid);
         if session::close(self.owner) && STATE.active_pid() == self.pid {
             STATE.set_game(None);
         }
@@ -174,6 +175,15 @@ impl CommunicationService {
 
     fn call(&self, f: impl FnOnce(&mut Session, u64) -> core::result::Result<(), LdnError>) -> Result<()> {
         self.with(f)?.map_err(ldn_rc)
+    }
+
+    /// A call that ends a room or the session: logged with the state it found and its
+    /// result, so a teardown in the remote log says who started it.
+    fn teardown(&self, name: &str, f: impl FnOnce(&mut Session, u64) -> core::result::Result<(), LdnError>) -> Result<()> {
+        let before = self.with(|s, _| s.state()).ok();
+        let r = self.with(f).and_then(|r| r.map_err(ldn_rc));
+        log!(Info, "ldn: game called {name} in {before:?}: {}", if r.is_ok() { "ok" } else { "failed" });
+        r
     }
 
     /// A relay-bound command: `Ok(true)` when its reply is in (answer now),
@@ -263,10 +273,18 @@ impl ICommunicationServer for CommunicationService {
         mut updates: sf::OutPointerBuffer<'_, NodeLatestUpdate>,
     ) -> Result<()> {
         let count = updates.get_count();
+        // Once per buffer size: proves the game polls node updates (and that the size arrives).
+        static LAST_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+        if LAST_COUNT.swap(count, core::sync::atomic::Ordering::Relaxed) != count {
+            log!(Info, "ldn: game reads node updates, room for {count}");
+        }
         let (network, changes) = self.with(|s, _| {
             let changes = s.get_network_info_latest_update(count.min(NODE_COUNT_MAX));
             (*s.network_info(), changes)
         })?;
+        if changes.iter().any(|c| *c != NodeStateChange::None) {
+            log!(Info, "ldn: game read node changes {changes:?}");
+        }
         if let Some(dst) = info.as_maybeuninit_mut()?.first_mut() {
             dst.write(network);
         }
@@ -299,7 +317,7 @@ impl ICommunicationServer for CommunicationService {
     }
 
     fn close_access_point(&mut self) -> Result<()> {
-        self.call(|s, now| s.close_access_point(now))
+        self.teardown("CloseAccessPoint", |s, now| s.close_access_point(now))
     }
 
     fn create_network(&mut self, config: Raw<CreateNetworkConfig>) -> Result<()> {
@@ -327,10 +345,13 @@ impl ICommunicationServer for CommunicationService {
     }
 
     fn destroy_network(&mut self) -> Result<()> {
-        self.call(|s, now| s.destroy_network(now))
+        self.teardown("DestroyNetwork", |s, now| s.destroy_network(now))
     }
 
     fn reject(&mut self, node_id: u32) -> Result<()> {
+        if self.first {
+            log!(Info, "ldn: game called Reject(node {node_id})");
+        }
         self.request(|s, now| s.reject(node_id, now)).map(drop)
     }
 
@@ -356,7 +377,7 @@ impl ICommunicationServer for CommunicationService {
     }
 
     fn close_station(&mut self) -> Result<()> {
-        self.call(|s, now| s.close_station(now))
+        self.teardown("CloseStation", |s, now| s.close_station(now))
     }
 
     fn connect(&mut self, data: Raw<ConnectNetworkData>, network: sf::InFixedPointerBuffer<'_, NetworkInfo>) -> Result<()> {
@@ -377,7 +398,7 @@ impl ICommunicationServer for CommunicationService {
     }
 
     fn disconnect(&mut self) -> Result<()> {
-        self.call(|s, now| s.disconnect(now))
+        self.teardown("Disconnect", |s, now| s.disconnect(now))
     }
 
     fn initialize(&mut self, process_id: ProcessId) -> Result<()> {
@@ -385,7 +406,10 @@ impl ICommunicationServer for CommunicationService {
     }
 
     fn finalize(&mut self) -> Result<()> {
-        let _ = self.with(|s, now| s.finalize(now));
+        let _ = self.teardown("Finalize", |s, now| {
+            s.finalize(now);
+            Ok(())
+        });
         if STATE.active_pid() == self.pid {
             STATE.set_game(None);
         }

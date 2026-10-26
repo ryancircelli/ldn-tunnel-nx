@@ -37,6 +37,7 @@ export enum PacketId {
   UpdateManifest = 0xc2, // relay -> console: SignedManifest, or empty when the channel has no release
   UpdateChunk = 0xc3, // console -> relay: UpdateChunkRequest
   UpdateChunkData = 0xc4, // relay -> console: UpdateChunkHeader + data
+  Resume = 0xc5, // console -> relay on a new link: old session id (16) + room session id (16); see Relay.resume
   Ping = 254,
   NetworkError = 255,
 }

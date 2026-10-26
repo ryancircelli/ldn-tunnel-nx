@@ -20,6 +20,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use ldn_tunnel_core::ldn::Payload;
 use ldn_tunnel_core::wire::{PacketId, ProxyDataHeader};
@@ -42,6 +43,13 @@ const SESSION_RESERVE: usize = 8;
 
 static QUEUE: Mutex<VecDeque<(PacketId, Vec<u8>)>> = Mutex::new(VecDeque::new());
 pub(super) static SIGNAL: KEvent = KEvent::new();
+/// The session is resuming its room on a new link: game datagrams are dropped (stale by the
+/// time the room is back), not refused, so the game sees a lossy network, not an error.
+static DROPPING: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn set_dropping(on: bool) {
+    DROPPING.store(on, Relaxed);
+}
 
 fn enqueue(limit: usize, id: PacketId, bytes: Vec<u8>) -> bool {
     {
@@ -64,6 +72,9 @@ pub(super) fn push(id: PacketId, payload: Payload) {
 
 /// A game datagram; false when the queue is full.
 pub(crate) fn push_proxy_data(header: &ProxyDataHeader, data: &[u8]) -> bool {
+    if DROPPING.load(Relaxed) {
+        return true;
+    }
     let mut bytes = Vec::with_capacity(size_of::<ProxyDataHeader>().saturating_add(data.len()));
     bytes.extend_from_slice(header.as_bytes());
     bytes.extend_from_slice(data);
@@ -73,6 +84,11 @@ pub(crate) fn push_proxy_data(header: &ProxyDataHeader, data: &[u8]) -> bool {
 /// The relay link went away: what is queued was for it.
 pub(super) fn clear() {
     QUEUE.lock().clear();
+}
+
+/// Nothing waits to be sent (the remote log yields to game packets).
+pub fn is_empty() -> bool {
+    QUEUE.lock().is_empty()
 }
 
 /// Oldest queued packet: its id, and its payload copied into `payload`.

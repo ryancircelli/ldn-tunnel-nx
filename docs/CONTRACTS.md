@@ -56,6 +56,7 @@ registers the socket under `s.sid`, `await open(conn, s)`; then `message(conn, b
 - `GET /api/consoles` → `[{id, name, version, runningBuild, online, lastSeen, rejectedBuild}]` (deploy-time tokens: `id = "env:TOKEN_X"`, cannot be revoked or renamed here → 400)
 - `POST /api/consoles/:id/revoke` (closes its sockets) · `PATCH /api/consoles/:id` {name}
 - `GET /api/consoles/:id/logs?limit=` → `[{at, line}]` (default 200, max 2000)
+- `GET /api/drops?limit=` → newest first, last 500: `{at, ev: "drop", who, by: relay|peer|error, code, reason, clean, colo, country, age_s, frames_in, frames_out, idle_in_ms, idle_out_ms, do_start, same_sec}` , `{at, ev: "relay-start", sockets: 0}`, and the resume outcomes `{at, ev: "resume", awayMs, ..}` / `{at, ev: "leave", why: "not resumed", ..}` / `{at, ev: "resume-refused", ..}` (drop and start rows: Cloudflare only; `relay/src/core/drops.ts`; `npm run drops` lays them next to the consoles' `relay: link ended` lines)
 - `POST /api/invites` {name?} → `{url, expiresAt}` · `GET /invite/:token` → HTML page with a download button · `POST /invite/:token` → zip, consumes the invite (one-time, 24 h; a link preview's GET never uses it up)
 - `GET /api/release` → `{deployed: {version, build}, latest?: {version, build, url}, platform, canSelfUpdate, updateCommand?, installError?}`
 - `POST /api/update` {version?} (default latest; needs a `Deployer`, i.e. Cloudflare with `CF_API_TOKEN` + `CF_ACCOUNT_ID`) · `POST /api/rollback`
@@ -81,3 +82,5 @@ seconds since epoch), `relay-cloudflare.zip` (`npm run bundle`: `worker.js`, `wo
 (the 65-byte point as hex); release CI compiles the same point into the module as `LDNT_UPDATE_PUBKEY`.
 `relay/release.json` `{repo, tag}` pins the release a relay is; CI refuses a tag it does not name.
 Docker image tag = `v<semver>`.
+The bundle is built, signed and checked by `tools/release` (Rust, `ldn-tunnel-release`; manifest layout and
+signature check are `crates/core/src/update.rs`).

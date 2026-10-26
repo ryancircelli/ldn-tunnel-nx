@@ -4,13 +4,19 @@ import { DurableObject } from "cloudflare:workers";
 import { unzipSync } from "fflate";
 import { Relay, type Session } from "../core/relay.ts";
 import type { Conn, Deployer, Host } from "../core/ports.ts";
+import { Drops, type Edge } from "../core/drops.ts";
 import ca from "../../assets/ca.pem";
 import gamelist from "../../assets/gamelist.txt";
 import { COMPATIBILITY_DATE } from "./compat.ts";
 
-const conn = (ws: WebSocket): Conn => ({
-  send: (b) => ws.send(b),
-  close: (code, reason) => ws.close(code, reason),
+type Tagged = Session & { edge?: Edge };
+const conn = (ws: WebSocket, drops?: Drops): Conn => ({
+  send: (b) => (drops?.out(ws), ws.send(b)),
+  close: (code, reason) => {
+    const s = ws.deserializeAttachment() as Tagged | null;
+    drops?.ended(ws, "relay", code, reason, true, s?.who, s?.edge);
+    ws.close(code, reason);
+  },
   load: <T>() => ws.deserializeAttachment() as T | null,
   save: (s) => ws.serializeAttachment(s),
 });
@@ -74,6 +80,7 @@ export function cloudflareDeployer(env: Record<string, unknown>, f: typeof fetch
 
 export class Lobby extends DurableObject<Env> {
   private relay: Relay;
+  private drops: Drops;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -84,10 +91,10 @@ export class Lobby extends DurableObject<Env> {
         exec: <T>(q: string, ...b: unknown[]) => ctx.storage.sql.exec(q, ...(b as SqlStorageValue[])).toArray() as T[],
         tx: (fn) => ctx.storage.transactionSync(fn),
       },
-      conns: () => ctx.getWebSockets().map(conn),
+      conns: () => ctx.getWebSockets().map((ws) => conn(ws, this.drops)),
       conn: (sid) => {
         const ws = ctx.getWebSockets(sid)[0];
-        return ws && conn(ws);
+        return ws && conn(ws, this.drops);
       },
       getAlarm: () => ctx.storage.getAlarm(),
       setAlarm: (at) => ctx.storage.setAlarm(at),
@@ -97,6 +104,7 @@ export class Lobby extends DurableObject<Env> {
       platform: "cloudflare",
       deployer: cloudflareDeployer(e, f),
     };
+    this.drops = new Drops(host.sql, ctx.getWebSockets().length);
     this.relay = new Relay(host);
   }
 
@@ -104,24 +112,27 @@ export class Lobby extends DurableObject<Env> {
     const r = await this.relay.http(req);
     if (r instanceof Response) return r;
     const [client, server] = Object.values(new WebSocketPair());
-    const s: Session = this.relay.newSession(r.accept);
+    const s: Tagged = { ...this.relay.newSession(r.accept), edge: { at: Date.now(), colo: req.cf?.colo as string, country: req.cf?.country as string } };
     this.ctx.acceptWebSocket(server, [s.sid]);
-    await this.relay.open(conn(server), s);
+    await this.relay.open(conn(server, this.drops), s);
     return new Response(null, { status: 101, webSocket: client });
   }
 
   async webSocketMessage(ws: WebSocket, msg: ArrayBuffer | string) {
-    this.relay.message(conn(ws), msg);
+    this.drops.in(ws);
+    this.relay.message(conn(ws, this.drops), msg);
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
-    console.log({ ev: "ws-close", by: "console", code, reason, wasClean, who: conn(ws).load<Session>()?.who });
-    this.relay.closed(conn(ws));
+    const s = conn(ws).load<Tagged>();
+    this.drops.ended(ws, "peer", code, reason, wasClean, s?.who, s?.edge);
+    this.relay.closed(conn(ws, this.drops));
   }
 
   async webSocketError(ws: WebSocket, error: unknown) {
-    console.log({ ev: "ws-error", error: String(error), who: conn(ws).load<Session>()?.who });
-    this.relay.closed(conn(ws));
+    const s = conn(ws).load<Tagged>();
+    this.drops.ended(ws, "error", 1006, String(error), false, s?.who, s?.edge);
+    this.relay.closed(conn(ws, this.drops));
   }
 
   async alarm() {

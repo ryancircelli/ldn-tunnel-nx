@@ -7,36 +7,26 @@
  */
 
 #include "views/settings/notifications_gui.hpp"
-#include "app/config_actions.hpp"
-#include "app/overlay_state.hpp"
 
 NotificationsGui::~NotificationsGui() {
-    SaveIfDirty();  // leaving the page must not lose changes
+    ldnt_save_if_dirty();  // leaving the page must not lose changes
 }
 
-void NotificationsGui::AddToggle(tsl::elm::List* list, const char* label, u32 bit) {
-    LdnTunnelConfigService* svc = ldnTunnelGetService();
-    u32 flags = 0;
-    if (svc) ldnTunnelGetNotifyFlags(svc, &flags);
-    auto toggle = new tsl::elm::ToggleListItem(label, (flags & bit) != 0);
-    toggle->setStateChangedListener([toggle, bit](bool on) {
-        LdnTunnelConfigService* s = ldnTunnelGetService();
-        u32 cur = 0;
-        if (!s || R_FAILED(ldnTunnelGetNotifyFlags(s, &cur))) { toggle->setState(!on); return; }
-        cur = on ? (cur | bit) : (cur & ~bit);
-        if (R_FAILED(ldnTunnelSetNotifyFlags(s, cur))) { toggle->setState(!on); return; }
-        OverlayState::Instance().MarkDirty();
+void NotificationsGui::AddToggle(tsl::elm::List* list, const char* label, LdntNotify which) {
+    auto toggle = new tsl::elm::ToggleListItem(label, ldnt_notify_enabled(which));
+    toggle->setStateChangedListener([toggle, which](bool on) {
+        if (!ldnt_set_notify(which, on)) toggle->setState(!on);
     });
     list->addItem(toggle);
 }
 
 tsl::elm::Element* NotificationsGui::createUI() {
-    auto frame = new tsl::elm::OverlayFrame("Notifications", OverlayState::Instance().GetVersion());
+    auto frame = new tsl::elm::OverlayFrame("Notifications", ldnt_version());
     auto list = new tsl::elm::List();
     list->addItem(new tsl::elm::CategoryHeader("Show a message when..."));
-    AddToggle(list, "Updates", LDNT_NOTIFY_UPDATES);
-    AddToggle(list, "Game start", LDNT_NOTIFY_GAME_START);
-    AddToggle(list, "Connection", LDNT_NOTIFY_CONNECTION);
+    AddToggle(list, "Updates", LdntNotify_Updates);
+    AddToggle(list, "Game start", LdntNotify_GameStart);
+    AddToggle(list, "Connection", LdntNotify_Connection);
     frame->setContent(list);
     return frame;
 }

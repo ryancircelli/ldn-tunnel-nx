@@ -1,13 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/core"]
+members = ["crates/core", "crates/overlay", "tools/release"]
 # crates/sys (the Horizon shell) is built separately with the nightly
 # aarch64-nintendo-switch-freestanding target; see crates/sys/README.md.
 exclude = ["crates/sys", "crates/tls", "relay", "overlay"]
-default-members = ["crates/core"]
+default-members = ["crates/core", "crates/overlay", "tools/release"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-2.0-or-later"
 
@@ -24,3 +24,10 @@ unreachable = "deny"
 todo = "deny"
 unimplemented = "deny"
 arithmetic_side_effects = "warn"
+
+# The overlay's staticlib (crates/overlay, `make overlay-rs`): small, one object per crate.
+[profile.overlay]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1

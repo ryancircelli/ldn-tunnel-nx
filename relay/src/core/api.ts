@@ -5,6 +5,7 @@ import { adminPage, adminCsp } from "./admin/index.ts";
 import { same, sha256Hex } from "./auth.ts";
 import { createInvite, cleanName } from "./invite.ts";
 import { PIN, ensureInstalled, installed, latest, tagOf, update } from "./release.ts";
+import { listDrops } from "./drops.ts";
 import { notFound, randomHex, text, type Relay, type Session } from "./relay.ts";
 
 const COOKIE = "ldnt_admin";
@@ -139,6 +140,7 @@ export async function adminApi(r: Relay, req: Request): Promise<Response> {
     if ((a = path.match(/^\/api\/consoles\/([^/]+)\/revoke$/)) && m === "POST") return revoke(r, decodeURIComponent(a[1]));
     if ((a = path.match(/^\/api\/consoles\/([^/]+)$/)) && m === "PATCH") return rename(r, decodeURIComponent(a[1]), (await body(req)).name);
     if ((a = path.match(/^\/api\/consoles\/([^/]+)\/logs$/)) && m === "GET") return logs(r, decodeURIComponent(a[1]), url.searchParams.get("limit"));
+    if (path === "/api/drops" && m === "GET") return json(listDrops(r.sql, Number(url.searchParams.get("limit")) || undefined));
     if (path === "/api/invites" && m === "POST") return json(await createInvite(r, url.origin, cleanName((await body(req)).name)));
     if (path === "/api/release" && m === "GET") return json(await release(r));
     if (path === "/api/update" && m === "POST") {

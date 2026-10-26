@@ -1,0 +1,4 @@
+# crates/overlay as a staticlib for the Tesla overlay (`make overlay-rs`): the .ovl is a PIE
+# linked by devkitA64 (-fPIE), so PIC; no unwind tables (panic = abort, nothing unwinds).
+[target.aarch64-unknown-none]
+rustflags = ["-C", "relocation-model=pic", "-C", "target-cpu=cortex-a57", "-C", "force-unwind-tables=no"]

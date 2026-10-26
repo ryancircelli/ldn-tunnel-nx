@@ -43,6 +43,9 @@ pub const LOG_TEXT_MAX: usize = 120;
 pub const IDLE_TIMEOUT_MS: u64 = 6000;
 /// Per phase of bringing the link up: transport open, then Initialize reply (C++ handshake wait).
 pub const LINK_TIMEOUT_MS: u64 = 5000;
+/// A relay link lost in a room is reconnected and the room resumed (`PacketId::Resume`) for
+/// this long before the game is told; the relay keeps the node 15 s (relay.ts `RESUME_GRACE_MS`).
+pub const RESUME_MS: u64 = 12_000;
 const SCAN_TIMEOUT_MS: u64 = 1000;
 const CONNECT_TIMEOUT_MS: u64 = 5000;
 /// Ryujinx FailureTimeout, used by the Private variants.
@@ -186,6 +189,15 @@ enum Outcome {
     NoLink,
 }
 
+/// A room being resumed on a new link after the old one dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Resume {
+    /// Give up (the game sees the room lost) at this time.
+    deadline: u64,
+    /// The dropped link's session id: the relay finds our node by it.
+    sid: [u8; 16],
+}
+
 struct Request {
     op: Op,
     id: PacketId,
@@ -224,6 +236,8 @@ pub struct Session {
     mac: [u8; 6],
     request: Option<Request>,
     reply: Option<Result<(), LdnError>>,
+    /// The link dropped in a room: the game is not told while this runs (see [`RESUME_MS`]).
+    resume: Option<Resume>,
     outbox: Deque<Action, OUTBOX>,
 }
 
@@ -255,6 +269,7 @@ impl Session {
             mac: INITIAL_MAC,
             request: None,
             reply: None,
+            resume: None,
             outbox: Deque::new(),
         }
     }
@@ -281,6 +296,7 @@ impl Session {
             link,
             self.request.as_ref().and_then(|r| r.deadline),
             self.idle_deadline,
+            self.resume.map(|r| r.deadline),
         ]
         .into_iter()
         .flatten()
@@ -311,7 +327,8 @@ impl Session {
     /// GetIpv4Address: our virtual IP and mask while the relay link is up, else
     /// `None` and the shell answers with the console's own address (nifm).
     pub fn get_ipv4_address(&self) -> Option<(u32, u32)> {
-        (self.link == Link::Ready && self.ipv4 != 0).then_some((self.ipv4, self.mask))
+        // A room being resumed keeps its address: the game must not see the network go.
+        ((self.link == Link::Ready || self.resume.is_some()) && self.ipv4 != 0).then_some((self.ipv4, self.mask))
     }
 
     pub fn get_disconnect_reason(&self) -> DisconnectReason {
@@ -369,6 +386,12 @@ impl Session {
 
     pub fn is_relay_ready(&self) -> bool {
         self.link == Link::Ready
+    }
+
+    /// The link dropped in a room and the room is being resumed: keep the game's proxy
+    /// sockets, drop its packets until the room is back.
+    pub fn is_resuming(&self) -> bool {
+        self.resume.is_some()
     }
 
     // ------------------------------------------------------------ IPC: lifecycle
@@ -691,8 +714,20 @@ impl Session {
         }
         self.relay_id = id;
         self.mac = mac;
+        self.link_ready(now);
+    }
+
+    /// Handshake done (either way): resume the room, send the request that waited for the link.
+    fn link_ready(&mut self, now: u64) {
         self.link = Link::Ready;
         log!(self, Info, "relay handshake done");
+        if let Some(r) = self.resume {
+            let mut req = [0u8; 32];
+            let (old, room) = req.split_at_mut(16);
+            old.copy_from_slice(&r.sid);
+            room.copy_from_slice(&self.network_info.network_id.session_id.data);
+            self.send(PacketId::Resume, &req);
+        }
         if self.request.as_ref().is_some_and(|r| r.deadline.is_none()) {
             self.send_request(now);
         }
@@ -704,8 +739,14 @@ impl Session {
         self.link_down(now, false);
     }
 
-    /// Timers: link setup, request timeouts, the idle timeout.
+    /// Timers: room resume, link setup, request timeouts, the idle timeout.
     pub fn poll(&mut self, now: u64) {
+        if self.resume.is_some_and(|r| now >= r.deadline) {
+            log!(self, Warn, "room not resumed within {RESUME_MS} ms");
+            self.resume = None;
+            self.link_down(now, true); // the room goes with the link, as before resuming existed
+
+        }
         if let Link::Opening { deadline } | Link::Handshaking { deadline } = self.link
             && now >= deadline
         {
@@ -744,11 +785,7 @@ impl Session {
                         self.relay_id = msg.id.data;
                         self.mac = msg.mac_address.data;
                     }
-                    self.link = Link::Ready;
-                    log!(self, Info, "relay handshake done");
-                    if self.request.as_ref().is_some_and(|r| r.deadline.is_none()) {
-                        self.send_request(now);
-                    }
+                    self.link_ready(now);
                     return None;
                 }
                 PacketId::NetworkError | PacketId::Disconnect => {
@@ -762,6 +799,10 @@ impl Session {
             }
         }
         match id {
+            PacketId::Connected if self.resume.take().is_some() => {
+                self.on_sync_network(data);
+                log!(self, Info, "room resumed on the new relay link");
+            }
             PacketId::Connected => self.on_connected(data, now),
             PacketId::SyncNetwork => self.on_sync_network(data),
             PacketId::Disconnect => {
@@ -1027,11 +1068,28 @@ impl Session {
         }
     }
 
-    /// Bring the link down; `close` asks the shell to close the transport.
+    /// Bring the link down; `close` asks the shell to close the transport. A link that
+    /// dropped by itself in a room is reconnected instead and the room resumed.
     fn link_down(&mut self, now: u64, close: bool) {
         if self.link == Link::Down {
             return;
         }
+        if !close && self.network_connected {
+            let r = *self.resume.get_or_insert(Resume {
+                deadline: now.saturating_add(RESUME_MS),
+                sid: self.relay_id,
+            });
+            log!(self, Info, "relay link lost in a room: reconnecting to resume it");
+            self.link = Link::Opening { deadline: r.deadline };
+            self.push(Action::RelayConnect);
+            match self.request.as_ref().map(|r| r.deadline) {
+                Some(None) => self.complete(Outcome::NoLink, now),
+                Some(Some(_)) => self.complete(Outcome::Timeout, now),
+                None => {}
+            }
+            return;
+        }
+        self.resume = None;
         if close {
             self.push(Action::RelayDisconnect);
         }
@@ -1051,6 +1109,7 @@ impl Session {
 
     /// Leave the room ourselves (Ryujinx DisconnectNetwork).
     fn leave_network(&mut self, now: u64) {
+        self.resume = None;
         let was_connected = self.network_connected;
         self.network_connected = false;
         self.network_info = NetworkInfo::new_zeroed();
@@ -1069,6 +1128,7 @@ impl Session {
 
     /// The relay removed us from the room (host left, kicked) or the link died.
     fn room_lost(&mut self, now: u64) {
+        self.resume = None;
         self.network_connected = false;
         self.network_info = NetworkInfo::new_zeroed();
         self.prev_node_connected = [false; NODE_COUNT_MAX];
@@ -1142,6 +1202,13 @@ impl Session {
         }
         if let Ok((mut info, _)) = NetworkInfo::read_from_prefix(data) {
             self.fix_network_info(&mut info);
+            let (old, new) = (self.network_info.ldn, info.ldn);
+            for (i, (o, n)) in old.nodes.iter().zip(new.nodes.iter()).enumerate() {
+                if (o.is_connected != 0) != (n.is_connected != 0) {
+                    let what = if n.is_connected != 0 { "joined" } else { "left" };
+                    log!(self, Info, "room: node {i} {what}, {}/{} nodes", new.node_count, new.node_count_max);
+                }
+            }
             self.network_info = info;
             self.push(Action::StateChanged);
         }
@@ -1154,6 +1221,14 @@ impl Session {
         if code == Some(NETWORK_ERROR_PORT_UNREACHABLE) {
             // Upstream PortUnreachable: a note about P2P, Connected follows. Not a reply.
             log!(self, Info, "relay: P2P port unreachable (ignored)");
+            return;
+        }
+        if self.resume.is_some() && self.link == Link::Ready {
+            // The relay no longer holds our node: the room is gone after all, and the link
+            // with it (proxies reset), as if it had never been resumed.
+            log!(self, Warn, "relay could not resume the room ({code:?})");
+            self.resume = None;
+            self.link_down(now, true);
             return;
         }
         if let Some(code) = code {

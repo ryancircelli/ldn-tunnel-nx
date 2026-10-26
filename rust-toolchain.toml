@@ -3,3 +3,4 @@
 [toolchain]
 channel = "nightly-2026-10-25"
 components = ["rust-src", "clippy", "rustfmt", "llvm-tools"]
+targets = ["aarch64-unknown-none"] # crates/overlay (staticlib linked into the Tesla overlay)

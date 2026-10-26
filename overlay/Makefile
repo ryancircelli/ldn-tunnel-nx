@@ -20,10 +20,10 @@ include $(DEVKITPRO)/libnx/switch_rules
 # INCLUDES is a list of directories containing header files
 #---------------------------------------------------------------------------------
 # The one place the overlay name lives. Keep in sync with crates/core/src/ident.rs
-# (NAME, OVERLAY_PATH = sdmc:/switch/.overlays/ldn-tunnel.ovl, CFG_SERVICE = ldnt:cfg;
-# the service name itself is in source/ldn_tunnel_ipc.c).
+# (NAME, OVERLAY_PATH = sdmc:/switch/.overlays/ldn-tunnel.ovl; the Rust half takes
+# CFG_SERVICE and PROGRAM_ID_HEX from there).
 NAME        := ldn-tunnel
-TARGET_VERSION := 0.1.0
+TARGET_VERSION := 0.1.1
 VERSION_DEFINES := -DLDNT_VERSION="\"${TARGET_VERSION}\""
 
 APP_TITLE   := $(NAME)
@@ -34,7 +34,8 @@ BUILD       := build
 SOURCES     := source
 DATA        := data
 INCLUDES    := include \
-               source
+               source \
+               ../crates/overlay/include
 
 NO_ICON     := 1
 
@@ -83,7 +84,16 @@ CXXFLAGS := $(CFLAGS) -fno-exceptions -std=c++20
 ASFLAGS := -g $(ARCH)
 LDFLAGS = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS    := -lnx
+#---------------------------------------------------------------------------------
+# The Rust half (crates/overlay): ldnt:cfg client, status texts, auto-save, restart
+# sequence. Built on the host by `make overlay-rs` in the repo root (the devkitpro image
+# has no cargo); RUST_LIB points elsewhere (CI artifact, CARGO_TARGET_DIR).
+# Header: ../crates/overlay/include/ldn_tunnel_overlay.h (cbindgen, `make overlay-header`).
+#---------------------------------------------------------------------------------
+RUST_LIB ?= $(CURDIR)/../target/aarch64-unknown-none/overlay/libldn_tunnel_overlay.a
+export RUST_LIB := $(abspath $(RUST_LIB))
+
+LIBS    := -lldn_tunnel_overlay -lnx
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
@@ -140,7 +150,7 @@ export INCLUDE  := $(foreach dir,$(INCLUDES),-I$(TOPDIR)/$(dir)) \
                    $(foreach dir,$(LIBDIRS),-I$(dir)/include) \
                    -I$(TOPDIR)/$(BUILD)
 
-export LIBPATHS := $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
+export LIBPATHS := $(foreach dir,$(LIBDIRS),-L$(dir)/lib) -L$(TOPDIR)/$(BUILD)
 
 ifeq ($(strip $(CONFIG_JSON)),)
     jsons := $(wildcard *.json)
@@ -202,6 +212,7 @@ dist: all
 	@echo "Created $(TARGET).zip"
 
 $(BUILD):
+	@test -f "$(RUST_LIB)" || { echo "missing $(RUST_LIB): run make overlay-rs in the repo root"; exit 1; }
 	@[ -d $@ ] || mkdir -p $@
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
@@ -225,7 +236,16 @@ $(OUTPUT).ovl:      $(OUTPUT).elf $(OUTPUT).nacp
 	@elf2nro $< $@ $(NROFLAGS)
 	@echo "built ... $(notdir $(OUTPUT).ovl)"
 
-$(OUTPUT).elf:  $(OFILES)
+$(OUTPUT).elf:  $(OFILES) libldn_tunnel_overlay.a
+
+#---------------------------------------------------------------------------------
+# Only the crate's own object (LTO: everything Rust is in it). The archive also carries
+# compiler_builtins, whose memcpy/memset/... would otherwise replace newlib's and libgcc's
+# for the whole overlay.
+#---------------------------------------------------------------------------------
+libldn_tunnel_overlay.a: $(RUST_LIB)
+	@cp $< $@
+	@$(AR) d $@ $$($(AR) t $@ | grep -v '^ldn_tunnel_overlay-')
 
 $(OFILES_SRC):  $(HFILES_BIN)
 

@@ -16,9 +16,14 @@ nx::rrt0_define_module_name!(ident::NAME);
 
 /// Every Box/Vec/Arc AND every extra thread's stack (nx::thread::Builder
 /// allocates stacks from this heap) lives here. It sits in .bss, so it costs
-/// memory but not NSO size. 1 MiB ran out once a game opened a room (every intercepted bsd
-/// session holds forward buffers); the maint thread logs the high-water mark every 30 s.
-const HEAP_SIZE: usize = 0x30_0000;
+/// memory but not NSO size. 1 MiB once ran out, but that was a leak (every finished bsd
+/// forward kept ~8 KiB; fixed). After the fix a 2-player race peaked at 304 KiB, and the
+/// worst case adds up to ~910 KiB: thread stacks + guard pages 212, TLS handshake (64 KiB
+/// CA file, roots, 3 record buffers, cert chain) ~180, outbox full (40 x ~2.1 KiB) 84,
+/// relay buffers 12, all 30 bsd:u sessions with a forward in flight (~12 KiB each) 363,
+/// config reload 20, update chunk 8, misc 30. Proxied-socket rings are in the static
+/// ROUTER, so player count adds nothing here. The maint thread logs every 64 KiB of growth.
+const HEAP_SIZE: usize = 0x10_0000;
 static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 // SAFETY (no_mangle): the symbol name is the one nx's rrt0 calls; nothing else

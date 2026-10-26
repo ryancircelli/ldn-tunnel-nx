@@ -2,12 +2,12 @@
 // revocation and CPU time per message. Tests that restart or alarm an object get one of their own.
 import { env, exports } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { DisconnectMessage, NetworkInfo, PacketId, PingMessage, ProxyConfig } from "../src/core/codec/types.ts";
 import { Ldn, ip } from "../tools/ldn-client.ts";
 import type { Lobby } from "../src/cloudflare/lobby.ts";
 import type { Relay, Session } from "../src/core/relay.ts";
-import { type Client, type Player, type Target, freshLcid, hex, join, perfScan, playSuite, ready, room, roster, sample } from "./play.ts";
+import { type Client, type Player, type Target, freshLcid, hex, join, perfScan, playSuite, ready, resumeSuite, room, roster, sample } from "./play.ts";
 
 const TOKEN = "a".repeat(64); // TOKEN_SWITCH_A in vitest.config.ts
 /** The relay core plus the private state these tests inspect. */
@@ -44,6 +44,29 @@ function object(name = "main", token = TOKEN) {
 }
 
 describe("play (Durable Object)", () => playSuite(object().target));
+
+describe("resume (Durable Object)", () => {
+  const { core, target } = object("resume");
+  // the grace is on for this object only (vitest.config.ts turns it off for the rest)
+  const grace = () => core((r) => void ((r as unknown as { grace: number }).grace = 15_000));
+  const expire = async () => {
+    await core((r) => {
+      for (const g of (r as unknown as { games: Map<string, { players: { gone?: number }[] }> }).games.values()) {
+        for (const p of g.players) if (p.gone !== undefined) p.gone -= 15_000;
+      }
+    });
+    await runDurableObjectAlarm(env.LOBBY.get(env.LOBBY.idFromName("resume")));
+  };
+  beforeAll(grace);
+  resumeSuite(target, expire);
+  it("the drops table has each socket end and each resume outcome", async () => {
+    const evs = await core((_r, state) => state.storage.sql.exec("SELECT row FROM drops").toArray().map((x) => JSON.parse(x.row as string)));
+    const kinds = new Set(evs.map((e) => e.ev));
+    for (const k of ["drop", "resume", "leave", "resume-refused"]) expect(kinds).toContain(k);
+    expect(evs.find((e) => e.ev === "leave")).toMatchObject({ why: "not resumed" });
+    expect(evs.some((e) => e.ev === "drop" && e.by === "relay" && e.reason === "resumed on a new socket")).toBe(true);
+  });
+});
 
 const closed = async (c: Client, code: number) => {
   await expect(c.next()).rejects.toThrow("closed");

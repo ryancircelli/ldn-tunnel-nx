@@ -219,32 +219,33 @@ fn link_loss_then_rejoin() {
     w.c[B].bind(7, 1234);
     assert_eq!(w.c[B].router.proxy_count(), 1);
 
-    // the transport under B breaks
+    // the transport under B breaks, and the relay drops B's node before B is back (grace over)
     let link = w.c[B].link.unwrap();
     w.relay.close(link);
     w.c[B].conn.transport_lost();
     w.pump();
-    assert_eq!(w.c[B].session.state(), CommState::Station, "the room is gone");
-    assert_eq!(w.c[B].session.get_disconnect_reason(), ldn_tunnel_core::ldn::DisconnectReason::DestroyedByUser);
-    assert!(node_ips(&w.c[B].session).is_empty());
-    assert_eq!(w.c[B].router.local_ip(), 0);
-    assert_eq!(w.c[B].router.proxy_count(), 0);
+    assert_eq!(w.c[B].session.state(), CommState::StationConnected, "resuming: the game is not told yet");
     assert_eq!(w.c[B].conn.state(), ConnectionState::Backoff);
     assert_eq!(w.c[B].conn.retry_count(), 1);
+    w.relay.expire();
+    w.pump();
     assert_eq!(node_ips(&w.c[A].session), [IP_A], "the host saw B leave");
 
-    // the Conn reconnects by itself after its backoff
+    // the Conn reconnects by itself after its backoff; the relay refuses the resume
     let wait = u64::from(w.c[B].conn.backoff_ms());
     w.advance(wait.saturating_sub(1));
     assert_eq!(w.c[B].conn.state(), ConnectionState::Backoff);
     for _ in 0..50 {
-        if w.c[B].conn.is_ready() {
+        if w.c[B].session.state() == CommState::Station {
             break;
         }
         w.advance(50);
     }
-    assert!(w.c[B].conn.is_ready());
-    assert_eq!(w.c[B].conn.retry_count(), 0);
+    assert_eq!(w.c[B].session.state(), CommState::Station, "the room is gone");
+    assert_eq!(w.c[B].router.local_ip(), 0);
+    assert_eq!(w.c[B].router.proxy_count(), 0);
+    assert_eq!(w.c[B].session.get_disconnect_reason(), ldn_tunnel_core::ldn::DisconnectReason::DestroyedByUser);
+    assert!(node_ips(&w.c[B].session).is_empty());
 
     // and B joins again: same node slot, but the relay's DHCP has moved on (dhcp.ts cycles)
     assert_eq!(scan(&mut w, B), 1);
@@ -575,27 +576,62 @@ fn host_quits_then_a_guest_hosts_the_next_race() {
     assert_eq!(node_ips(&w.c[B].session).len(), 2);
 }
 
-#[test]
-fn guest_link_drop_leaves_the_others_racing() {
-    let mut w = lobby(3);
-    bind_all(&mut w, &[0, 1, 2]);
-    let link = w.c[C].link.unwrap();
-    w.relay.close(link);
-    w.c[C].conn.transport_lost();
-    w.pump();
-    assert_eq!(w.c[C].session.state(), CommState::Station);
-    assert_eq!(w.c[C].router.proxy_count(), 0);
-    for i in [A, B] {
-        assert_eq!(node_ips(&w.c[i].session), [ip(1), ip(2)], "console {i}");
+/// Cuts the relay link of each console in `who` mid-race (hardware: Cloudflare closes the
+/// sockets, one or all at once), then checks that no game noticed and the race goes on.
+fn cut_mid_race(n: u8, who: &[usize]) {
+    let mut w = lobby(n);
+    let all: Vec<usize> = (0..usize::from(n)).collect();
+    bind_all(&mut w, &all);
+    let before: Vec<_> = all.iter().map(|&i| (w.c[i].session.state(), node_ips(&w.c[i].session), w.c[i].state_changes)).collect();
+    for &i in who {
+        let link = w.c[i].link.unwrap();
+        w.relay.close(link);
+        w.c[i].conn.transport_lost();
     }
-    w.c[B].sendto(&mut w.relay, 9, b"go", BROADCAST, PORT);
     w.pump();
-    assert_eq!(drain(&mut w, A), [(b"go".to_vec(), ip(2))]);
-    assert_eq!(drain(&mut w, B), [(b"go".to_vec(), ip(2))]);
+    for &i in who {
+        assert!(w.c[i].session.is_resuming(), "console {i}");
+        assert_eq!(w.c[i].sendto(&mut w.relay, 9, b"lost", BROADCAST, PORT), 4, "dropped, not an error");
+    }
+    w.advance(1000); // past the Conn's first backoff
+    let after: Vec<_> = all.iter().map(|&i| (w.c[i].session.state(), node_ips(&w.c[i].session), w.c[i].state_changes)).collect();
+    for (i, (b, a)) in before.iter().zip(&after).enumerate() {
+        assert_eq!((b.0, &b.1), (a.0, &a.1), "console {i}: same state and room");
+        assert!(a.2 <= b.2 + 1, "console {i}: at most the resume's StateChanged (no state change)");
+        assert!(!w.c[i].session.is_resuming() && w.c[i].conn.is_ready(), "console {i}");
+        assert_eq!(w.c[i].session.get_disconnect_reason(), DisconnectReason::None, "console {i}");
+        assert_eq!(w.c[i].router.local_ip(), ip(i as u32 + 1), "console {i}");
+    }
+    assert_eq!(w.relay.game_count(), 1);
+    for &i in &all {
+        drain(&mut w, i); // nothing of the dropped packets arrives
+        w.c[i].sendto(&mut w.relay, 9, b"go", BROADCAST, PORT);
+        w.pump();
+        for &j in &all {
+            assert_eq!(drain(&mut w, j), [(b"go".to_vec(), ip(i as u32 + 1))], "{i} -> {j}");
+        }
+    }
+    w.relay.expire(); // the grace runs out: nobody is left behind
+    assert_eq!(node_ips(&w.c[0].session).len(), usize::from(n));
 }
 
 #[test]
-fn host_link_drop_mid_race_status_and_recovery() {
+fn guest_link_drop_mid_race_is_resumed() {
+    cut_mid_race(3, &[C]);
+}
+
+#[test]
+fn host_link_drop_mid_race_is_resumed() {
+    cut_mid_race(2, &[A]);
+}
+
+#[test]
+fn relay_drops_every_link_at_once_and_all_resume() {
+    cut_mid_race(3, &[A, B, C]);
+}
+
+#[test]
+fn host_link_drop_past_the_grace_status_and_recovery() {
     let mut w = lobby(2);
     bind_all(&mut w, &[0, 1]);
     // the overlay's toasts, fed as the shell feeds them
@@ -616,8 +652,11 @@ fn host_link_drop_mid_race_status_and_recovery() {
 
     let link = w.c[A].link.unwrap();
     w.relay.close(link);
+    w.relay.expire(); // longer than the relay keeps the room
     w.c[A].conn.transport_lost();
     w.pump();
+    // the resume is refused once the link is back (~200 ms backoff)
+    tick(&mut w, 1000, &mut toasts, &mut seen);
     let s = &w.c[A].session;
     assert_eq!(s.state(), CommState::AccessPoint, "back to the lobby screen");
     assert_eq!(s.get_disconnect_reason(), DisconnectReason::DestroyedBySystem);
@@ -627,12 +666,9 @@ fn host_link_drop_mid_race_status_and_recovery() {
     assert_eq!(w.c[B].session.state(), CommState::Station, "the guest saw the room close");
     assert_eq!(w.relay.game_count(), 0);
 
-    // a short outage is not announced; a long one is, then the reconnect
-    tick(&mut w, 2000, &mut toasts, &mut seen);
-    assert_eq!(seen.len(), 2);
-    assert!(w.c[A].conn.is_ready(), "Conn reconnected by itself");
-    tick(&mut w, 6000, &mut toasts, &mut seen);
-    assert_eq!(seen.len(), 2, "back up within STABLE_MS: no toast at all");
+    // the room is gone and the link with it (the game is back in its lobby): what the overlay says
+    tick(&mut w, 8000, &mut toasts, &mut seen);
+    assert_eq!(seen, ["Online play on", "Connected", "Connection lost"]);
 
     // the next race: A hosts again, B finds it
     let now = w.now;
@@ -644,4 +680,94 @@ fn host_link_drop_mid_race_status_and_recovery() {
     assert_eq!(scan(&mut w, B), 1);
     assert_eq!(connect_with(&mut w, B, u32::from(VERSION)), Ok(()));
     assert_eq!(node_ips(&w.c[A].session), [ip(1), ip(2)]);
+}
+
+/// Hardware report: the guest quit a 2-console race from the game menu and the host was thrown
+/// out ("You have disconnected") the same second. Whatever order the guest tears down in, the
+/// host must only see node 1 leave: room open, no disconnect reason, link up, no toast.
+#[test]
+fn guest_quits_mid_race_host_keeps_the_room() {
+    type Teardown = fn(&mut Session, u64);
+    let orders: [(&str, Teardown); 3] = [
+        ("Disconnect, CloseStation, Finalize", |s, now| {
+            s.disconnect(now).unwrap();
+            s.close_station(now).unwrap();
+            s.finalize(now);
+        }),
+        ("Finalize", |s, now| s.finalize(now)),
+        ("Disconnect, then the idle timeout", |s, now| s.disconnect(now).unwrap()),
+    ];
+    for (name, teardown) in orders {
+        let mut w = lobby(2);
+        bind_all(&mut w, &[A, B]);
+        let mut toasts = Notifier::new(NotifyConfig::default());
+        let mut seen: Vec<String> = vec![];
+        toasts.on_event(Event::GameStarted { pid: 0x51, mode: LdnMode::Online }, w.now);
+        let host_up = |w: &World| w.c[A].conn.is_ready() && w.c[A].session.is_relay_ready();
+        assert_eq!(w.c[A].session.get_network_info_latest_update(8)[..2], [NodeStateChange::Connect; 2]);
+
+        // 60 Hz both ways: the host's race state broadcast, the guest's input to the host
+        let mut race = |w: &mut World, frames: u32, guest: bool, seen: &mut Vec<String>| {
+            for f in 0..frames {
+                let host_frame = [f as u8; 1200];
+                assert_eq!(w.c[A].sendto(&mut w.relay, 9, &host_frame, BROADCAST, PORT), 1200);
+                if guest {
+                    assert_eq!(w.c[B].sendto(&mut w.relay, 9, &[f as u8; 84], IP_A, PORT), 84);
+                }
+                w.advance(16);
+                toasts.on_event(Event::Relay { up: host_up(w) }, w.now);
+                while let Some(t) = toasts.poll(w.now) {
+                    seen.push(t.text.as_str().to_string());
+                }
+                let got = drain(w, A);
+                let want = if guest { 2 } else { 1 };
+                assert_eq!(got.len(), want, "{name}: host frame {f}");
+                if guest {
+                    assert_eq!(drain(w, B).len(), 1, "{name}: guest frame {f}");
+                }
+            }
+        };
+        race(&mut w, 600, true, &mut seen);
+        assert_eq!(seen, ["Online play on", "Connected"], "{name}");
+
+        // the guest's goodbye datagram, then its teardown
+        w.c[B].sendto(&mut w.relay, 9, b"bye", BROADCAST, PORT);
+        let now = w.now;
+        teardown(&mut w.c[B].session, now);
+        w.pump();
+        let got = drain(&mut w, A);
+        assert_eq!(got, [(b"bye".to_vec(), IP_B)], "{name}: the goodbye reaches the host");
+
+        let s = &mut w.c[A].session;
+        assert_eq!(s.state(), CommState::AccessPointCreated, "{name}");
+        assert_eq!(s.get_disconnect_reason(), DisconnectReason::None, "{name}");
+        assert_eq!(node_ips(s), [IP_A], "{name}");
+        assert_eq!(s.local_node_id(), 0, "{name}");
+        assert_eq!(s.get_ipv4_address(), Some((IP_A, 0xFFFF_0000)), "{name}");
+        let mut changes = [NodeStateChange::None; 8];
+        changes[1] = NodeStateChange::Disconnect;
+        assert_eq!(s.get_network_info_latest_update(8), changes, "{name}: only node 1 changed");
+        assert!(!w.c[A].logs.iter().any(|l| l.contains("left the room")), "{name}: {:?}", w.c[A].logs);
+        assert!(w.c[A].logs.iter().any(|l| l == "room: node 1 left, 1/8 nodes"), "{name}: {:?}", w.c[A].logs);
+        assert_eq!(w.c[A].router.local_ip(), IP_A, "{name}");
+        assert_eq!(w.c[A].router.poll_state(socket_key(1, 9)), PollState::Proxy { readable: false }, "{name}");
+
+        // the host races on alone for a minute (relay pings included): no toast, room still open
+        for k in 0..6u8 {
+            race(&mut w, 600, false, &mut seen);
+            let link = w.c[A].link.expect("host link");
+            w.relay.ping(link, k);
+        }
+        assert_eq!(seen, ["Online play on", "Connected"], "{name}");
+        assert_eq!(w.c[A].session.state(), CommState::AccessPointCreated, "{name}");
+        assert_eq!(w.relay.game_count(), 1, "{name}");
+        // and the guest can come back into the same room
+        if w.c[B].session.state() == CommState::None {
+            join(&mut w, B);
+        } else {
+            assert_eq!(scan(&mut w, B), 1, "{name}");
+            assert_eq!(connect_with(&mut w, B, u32::from(VERSION)), Ok(()), "{name}");
+        }
+        assert_eq!(node_ips(&w.c[A].session).len(), 2, "{name}");
+    }
 }

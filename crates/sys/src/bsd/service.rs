@@ -763,6 +763,7 @@ impl IBsdMitmServer for BsdMitmService {
     fn close(&mut self, fd: i32) -> Result<(i32, i32)> {
         let key = self.key(fd);
         if with(|r| r.on_close(key)) {
+            log!(Info, "bsd: client {} closed proxied fd {fd}", self.client);
             router::wake();
         }
         forward() // the real fd exists either way

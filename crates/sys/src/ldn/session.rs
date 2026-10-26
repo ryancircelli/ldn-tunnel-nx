@@ -150,6 +150,7 @@ fn drain(s: &mut Session, after: &mut After) {
 
 /// The overlay's view (ldnt:cfg GetLdnState / GetSessionInfo).
 fn publish(s: &Session) {
+    outbox::set_dropping(s.is_resuming());
     let state = s.state();
     STATE.ldn_state.store(state as u32, Relaxed);
     let ldn = s.network_info().ldn;
@@ -280,17 +281,19 @@ pub fn relay_ready(id: [u8; 16], mac: [u8; 6]) {
     });
 }
 
-/// The transport failed to come up, or closed without being asked to. The
-/// room is gone with it: the router is reset too (the session emits no
-/// RelayDisconnect for this).
+/// The transport failed to come up, or closed without being asked to. A room
+/// is resumed on a new link (the session asks for it again; the game's proxy
+/// sockets stay); anything else is gone with the link and the router is reset
+/// (the session emits no RelayDisconnect for this).
 pub fn relay_closed() {
     outbox::clear();
     request_relay(false);
     locked(|g, now, after| {
-        if let Some(slot) = g.as_mut() {
+        let resuming = g.as_mut().is_some_and(|slot| {
             slot.s.on_relay_closed(now);
-        }
-        after.reset = true;
+            slot.s.is_resuming()
+        });
+        after.reset = !resuming;
     });
 }
 

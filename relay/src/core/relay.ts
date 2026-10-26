@@ -25,10 +25,17 @@ import { BROADCAST, NETWORK_MASK, newDhcp, requestIp, returnIp, type Dhcp } from
 import type { Accept, Conn, Host, Sql } from "./ports.ts";
 import { bearer, isAdmin, sha256Hex, whoIs } from "./auth.ts";
 import { adminApi } from "./api.ts";
+import { record } from "./drops.ts";
 import { invite } from "./invite.ts";
 import { PIN, ensureInstalled, installed } from "./release.ts";
 
 const PING_INTERVAL = 10_000; // LdnServer.InactivityPingFrequency
+/**
+ * A player whose socket drops (Cloudflare cuts WebSockets under running games, or the object restarts) keeps its
+ * node, IP and the game this long, for its console to come back on a new socket and send Resume. The console gives
+ * up after 12 s (core ldn RESUME_MS). env RESUME_GRACE_MS overrides it; 0 = leave at once (the C# behaviour).
+ */
+const RESUME_GRACE_MS = 15_000;
 const GHOST_AGE = 16 * 3600_000; // LdnServer.Scan skips games older than this
 const MAC_TTL = 30 * 86400_000;
 const LOG_TTL = 3 * 86400_000;
@@ -65,6 +72,8 @@ interface Player {
   sid: string;
   ip: number;
   nodeId: number;
+  who?: string; // the token that joined: only the same console may resume the node
+  gone?: number; // when its socket dropped: it leaves at gone + grace unless resumed
 }
 
 interface Game {
@@ -130,10 +139,14 @@ export class Relay {
   private msgCount = 0;
   private countSince = Date.now();
   private lastPrune = 0;
+  private readonly grace: number;
   private writes = 0;
+  /** Per game ProxyData counters (memory only), logged when the game ends: `wrangler tail` shows why a room died. */
+  private traffic = new Map<string, { routed: number; dropped: number; last: number; maxGapMs: number }>();
 
   constructor(readonly host: Host) {
     const sql = (this.sql = host.sql);
+    this.grace = Number(host.env.RESUME_GRACE_MS ?? RESUME_GRACE_MS) || 0;
     for (const q of SCHEMA) sql.exec(q);
     // the old label-keyed table: pure status, repopulated by each console's next update check
     sql.exec("DROP TABLE IF EXISTS consoles");
@@ -230,18 +243,87 @@ export class Relay {
     this.closed(ws);
   }
 
-  /** LdnSession.OnDisconnected (socket closed or errored). Idempotent: a second call finds no game. */
+  /** LdnSession.OnDisconnected (socket closed or errored). A player keeps its node for the grace window. Idempotent. */
   closed(ws: Conn) {
     const s = ws.load<Session>();
     if (!s) return;
-    this.disconnectFromGame(ws, s);
     this.lastMsg.delete(s.sid);
+    const g = s.game ? this.games.get(s.game) : undefined;
+    const p = g && !g.closed && this.grace > 0 ? g.players.find((x) => x.sid === s.sid) : undefined;
+    if (!g || !p) return this.disconnectFromGame(ws, s, "socket closed");
+    if (p.gone !== undefined) return;
+    p.gone = Date.now();
+    this.persist(g);
+    console.log({ ev: "player-gone", game: g.id, who: s.who, node: p.nodeId, host: g.owner === s.sid, graceMs: this.grace });
+    this.armAlarm().catch((e) => console.error({ ev: "alarm-error", error: String(e) }));
+  }
+
+  /** Resume (relay-only): a console back on a new socket takes over its old node, IP and game. */
+  private resume(ws: Conn, s: Session, payload: Uint8Array) {
+    if (payload.length < 32 || s.game || !s.init) return this.error(ws, NetworkError.ConnectNotFound);
+    const old = hex(payload.subarray(0, 16));
+    const g = this.games.get(hex(payload.subarray(16, 32)));
+    const p = g && !g.closed ? g.players.find((x) => x.sid === old && x.who === s.who) : undefined;
+    if (!g || !p) {
+      record(this.sql, { ev: "resume-refused", who: s.who, game: g?.id ?? null, closed: g?.closed ?? null });
+      return this.error(ws, NetworkError.ConnectNotFound);
+    }
+    const stale = this.host.conn(old); // a socket the runtime has not reported closed yet
+    const os = stale?.load<Session>();
+    if (stale && os) {
+      os.game = null;
+      stale.save(os);
+      try {
+        this.hangUp(stale, 1000, "resumed on a new socket");
+      } catch {} // already closing
+    }
+    const away = p.gone === undefined ? 0 : Date.now() - p.gone;
+    if (g.owner === old) g.owner = s.sid;
+    p.sid = s.sid;
+    delete p.gone;
+    s.game = g.id;
+    s.ip = p.ip;
+    s.nodeId = p.nodeId;
+    s.mac = hex(g.info.ldn.nodes[p.nodeId].mac_address);
+    s.pass = g.pass;
+    ws.save(s);
+    this.persist(g);
+    record(this.sql, { ev: "resume", game: g.id, who: s.who, node: p.nodeId, host: g.owner === s.sid, awayMs: away });
+    this.send(ws, PacketId.ProxyConfig, ProxyConfig, { proxy_ip: s.ip, proxy_subnet_mask: NETWORK_MASK });
+    this.send(ws, PacketId.Connected, NetworkInfo, g.info);
+  }
+
+  /** Players whose grace ran out leave (a host's game closes); returns the next expiry, if any are still waiting. */
+  private expire(now: number): number | undefined {
+    let next: number | undefined;
+    for (const g of [...this.games.values()]) {
+      for (const p of [...g.players]) {
+        if (p.gone === undefined) continue;
+        const at = p.gone + this.grace;
+        if (at > now) {
+          next = Math.min(next ?? at, at);
+          continue;
+        }
+        record(this.sql, { ev: "leave", game: g.id, who: p.who, node: p.nodeId, host: g.owner === p.sid, why: "not resumed", left: g.players.length - 1 });
+        this.leave(g, p.sid);
+        if (g.owner === p.sid) this.close(g);
+      }
+    }
+    return next;
+  }
+
+  /** Makes sure the alarm runs (it expires the waiting players), even with no socket left. */
+  private async armAlarm() {
+    if ((await this.host.getAlarm()) === null) await this.host.setAlarm(Date.now() + PING_INTERVAL);
   }
 
   /** Replaces BackgroundPingTask + LdnSession.Ping. */
   async alarm() {
     const now = Date.now();
     const sockets = this.host.conns();
+    // expiries ride the ping rhythm (an earlier alarm would cut a console that had no time to answer its ping):
+    // a node is held 15–25 s
+    const waiting = this.expire(now) !== undefined;
     for (const ws of sockets) {
       const s = ws.load<Session>();
       if (!s) continue;
@@ -264,24 +346,38 @@ export class Relay {
       this.sql.exec("DELETE FROM logs WHERE at < ?", now - LOG_TTL);
       this.sql.exec("DELETE FROM logs WHERE id <= (SELECT MAX(id) FROM logs) - ?", LOG_MAX_ROWS);
     }
-    if (this.host.conns().length > 0) await this.host.setAlarm(Date.now() + PING_INTERVAL);
+    if (this.host.conns().length > 0 || waiting) await this.host.setAlarm(Date.now() + PING_INTERVAL);
   }
 
-  /** After a restart, drop players whose sockets are gone and close games whose owner is gone. */
+  /**
+   * After a restart: players whose sockets are gone get the grace window to resume (the object restarting under its
+   * consoles drops every socket); without one they leave, and games whose owner is gone close.
+   */
   private reconcile() {
     const live = new Set(this.host.conns().map((ws) => ws.load<Session>()?.sid));
+    const now = Date.now();
+    let waiting = false;
     for (const g of [...this.games.values()]) {
-      for (const p of g.players.filter((p) => !live.has(p.sid))) this.leave(g, p.sid);
-      if (!live.has(g.owner)) this.close(g);
+      for (const p of g.players.filter((p) => !live.has(p.sid))) {
+        if (this.grace > 0 && !g.closed) {
+          p.gone ??= now;
+          waiting = true;
+        } else this.leave(g, p.sid);
+      }
+      const ownerWaits = g.players.some((p) => p.sid === g.owner && p.gone !== undefined);
+      if (!live.has(g.owner) && !ownerWaits) this.close(g);
       else if (this.games.has(g.id)) this.persist(g);
     }
+    if (waiting) this.armAlarm().catch((e) => console.error({ ev: "alarm-error", error: String(e) }));
   }
 
-  private sendRaw(ws: Conn | undefined, bytes: Uint8Array) {
+  /** False if there was no socket or the send threw. */
+  private sendRaw(ws: Conn | undefined, bytes: Uint8Array): boolean {
     try {
       ws?.send(bytes);
+      return !!ws;
     } catch {
-      // socket already closing; its close handler cleans up
+      return false; // socket already closing; its close handler cleans up
     }
   }
 
@@ -304,6 +400,8 @@ export class Relay {
   }
 
   private drop(g: Game) {
+    console.log({ ev: "game-end", game: g.id, ...this.traffic.get(g.id) });
+    this.traffic.delete(g.id);
     this.games.delete(g.id);
     this.sql.exec("DELETE FROM games WHERE id = ?", g.id);
   }
@@ -341,9 +439,10 @@ export class Relay {
         return this.connectImpl(ws, s, hex(r.security_parameter.session_id), r.user_config.user_name, r.local_communication_version);
       }
       case PacketId.Scan: return this.scan(ws, s, payload);
+      case PacketId.Resume: return this.resume(ws, s, payload);
       case PacketId.Disconnect: {
         if (payload.length < DisconnectMessage.size) return;
-        return this.disconnectFromGame(ws, s);
+        return this.disconnectFromGame(ws, s, "Disconnect");
       }
       case PacketId.Ping: {
         const r = read(PingMessage, payload);
@@ -694,7 +793,7 @@ export class Relay {
 
     this.syncNetwork(g); // to the players already in the game
     s.game = g.id;
-    g.players.push({ sid: s.sid, ip: s.ip, nodeId });
+    g.players.push({ sid: s.sid, ip: s.ip, nodeId, who: s.who });
     ws.save(s);
     this.persist(g);
     this.send(ws, PacketId.Connected, NetworkInfo, g.info);
@@ -746,12 +845,13 @@ export class Relay {
   }
 
   /** LdnSession.DisconnectFromGame */
-  private disconnectFromGame(ws: Conn, s: Session) {
+  private disconnectFromGame(ws: Conn, s: Session, why: string) {
     const g = s.game ? this.games.get(s.game) : undefined;
     if (!s.game) return;
     s.game = null;
     ws.save(s);
     if (!g) return;
+    console.log({ ev: "leave", game: g.id, who: s.who, node: s.nodeId, host: g.owner === s.sid, why, left: g.players.length - 1 });
     this.leave(g, s.sid);
     if (g.owner === s.sid) this.close(g);
   }
@@ -805,6 +905,12 @@ export class Relay {
 
   /** HostedGame.RouteMessage */
   private route(s: Session, g: Game, type: PacketId, payload: Uint8Array, size: number) {
+    const now = Date.now();
+    let t = this.traffic.get(g.id);
+    if (!t) this.traffic.set(g.id, (t = { routed: 0, dropped: 0, last: now, maxGapMs: 0 }));
+    t.maxGapMs = Math.max(t.maxGapMs, now - t.last);
+    t.last = now;
+    t.dropped++; // undone below once the packet is delivered
     if (payload.length < size) return;
     // C# re-encodes the struct; ProxyData keeps the trailing data.
     const msg = packet(type, type === PacketId.ProxyData ? payload : payload.subarray(0, size));
@@ -814,11 +920,16 @@ export class Relay {
     else if (src !== s.ip) return; // can't pretend to be somebody else
     let dest = dv.getUint32(6, true);
     if (dest === BROADCAST_192) dest = BROADCAST; // routing only; the packet keeps 192.168.0.255
+    let sent = false;
     if (dest === BROADCAST) {
-      for (const p of g.players) this.sendRaw(this.host.conn(p.sid), msg); // includes the sender, as in C#
+      for (const p of g.players) sent = this.sendRaw(this.host.conn(p.sid), msg) || sent; // includes the sender, as in C#
     } else {
       const p = g.players.find((x) => x.ip === dest);
-      if (p) this.sendRaw(this.host.conn(p.sid), msg);
+      sent = !!p && this.sendRaw(this.host.conn(p.sid), msg);
+    }
+    if (sent) {
+      t.dropped--;
+      t.routed++;
     }
   }
 }

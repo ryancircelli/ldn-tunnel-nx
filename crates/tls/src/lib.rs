@@ -9,6 +9,7 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -68,6 +69,20 @@ impl<E: core::fmt::Debug> core::fmt::Display for Error<E> {
 
 impl<E: core::fmt::Debug> core::error::Error for Error<E> {}
 
+/// Traffic and how the session ended, for the shell's link-ended line ([`TlsStream::stats`]).
+#[derive(Clone, Debug, Default)]
+pub struct Stats {
+    /// Plaintext bytes moved, and `read`/`write` calls that moved some.
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub reads: u32,
+    pub writes: u32,
+    /// The first end seen: `close_notify` (the peer closed TLS cleanly), `UnexpectedEof` (TCP
+    /// EOF without close_notify), `Io(..)` (socket error, e.g. a reset), `Tls(..)` (alert or bad
+    /// record). A read timeout is not an end.
+    pub end: Option<String>,
+}
+
 /// Certificate validity is checked against the time given to [`connect`].
 #[derive(Debug)]
 struct FixedTime(UnixTime);
@@ -121,6 +136,7 @@ pub fn connect<T: Read + Write>(
         plain: Vec::new(),
         plain_pos: 0,
         peer_closed: false,
+        stats: Stats::default(),
     };
     stream.run(Goal::Handshake)?;
     Ok(stream)
@@ -147,9 +163,20 @@ pub struct TlsStream<T> {
     plain: Vec<u8>,
     plain_pos: usize,
     peer_closed: bool,
+    stats: Stats,
 }
 
 impl<T: Read + Write> TlsStream<T> {
+    pub const fn stats(&self) -> &Stats {
+        &self.stats
+    }
+
+    fn note_end(&mut self, e: &Error<T::Error>) {
+        if self.stats.end.is_none() && embedded_io::Error::kind(e) != ErrorKind::TimedOut {
+            self.stats.end = Some(alloc::format!("{e:?}"));
+        }
+    }
+
     /// Sends close_notify and returns the transport (the caller closes the socket).
     pub fn close(mut self) -> Result<T, Error<T::Error>> {
         self.run(Goal::Close)?;
@@ -284,7 +311,10 @@ impl<T: Read + Write> Read for TlsStream<T> {
         if self.plain_pos == self.plain.len() {
             self.plain.clear();
             self.plain_pos = 0;
-            self.run(Goal::Read)?;
+            if let Err(e) = self.run(Goal::Read) {
+                self.note_end(&e);
+                return Err(e);
+            }
         }
         let pending = self.plain.get(self.plain_pos..).unwrap_or_default();
         let n = pending.len().min(buf.len());
@@ -292,6 +322,14 @@ impl<T: Read + Write> Read for TlsStream<T> {
             *d = *s;
         }
         self.plain_pos = self.plain_pos.saturating_add(n);
+        if n == 0 {
+            if self.stats.end.is_none() {
+                self.stats.end = Some((if self.peer_closed { "close_notify" } else { "closed" }).into());
+            }
+        } else {
+            self.stats.rx_bytes = self.stats.rx_bytes.saturating_add(n as u64);
+            self.stats.reads = self.stats.reads.saturating_add(1);
+        }
         Ok(n)
     }
 }
@@ -302,7 +340,15 @@ impl<T: Read + Write> Write for TlsStream<T> {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.run(Goal::Write(buf))
+        let r = self.run(Goal::Write(buf));
+        match &r {
+            Ok(n) => {
+                self.stats.tx_bytes = self.stats.tx_bytes.saturating_add(*n as u64);
+                self.stats.writes = self.stats.writes.saturating_add(1);
+            }
+            Err(e) => self.note_end(e),
+        }
+        r
     }
 
     fn flush(&mut self) -> Result<(), Self::Error> {

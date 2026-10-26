@@ -50,6 +50,9 @@ GPL-2.0-only, embedded-tls cannot be used; use rustls or another TLS crate inste
 - `crates/`: GPL-2.0-or-later.
 - `overlay/`: sources GPL-2.0-or-later; the built overlay is GPL-2.0 (see c). Vendored
   libultrahand keeps its own LICENSE and SUB_LICENSE.
+- `crates/overlay`: the overlay's Rust half, GPL-2.0-or-later like `crates/`, linked into the
+  `.ovl` as a staticlib, so it ships under the overlay's GPL-2.0 (see c). Its dependencies are
+  crates/core and core's crates from (d); the MIT option of each keeps them GPL-2.0-compatible.
 - `relay/`: MIT (`relay/LICENSE`).
 - `NOTICE`: attributions that must travel with copies.
 

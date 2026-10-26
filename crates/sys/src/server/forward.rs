@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use nx::ipc::{self, cmif};
 use nx::result::{Result, ResultCode};
 use nx::svc;
+use nx::sync::Mutex;
 
 /// Size of an IPC message (the TLS message area).
 pub const MSG_SIZE: usize = 0x100;
@@ -23,7 +24,7 @@ struct Page([u8; 0x1000]);
 ///
 /// The kernel reads `data` when the real service receives the request and
 /// writes `page` and `recv` when it replies, so all three stay put until
-/// `event` signals. Dropping an unfinished forward leaks them (see Drop).
+/// `event` signals. Dropping an unfinished forward parks them in ORPHANS (see Drop).
 pub struct Forward {
     page: Box<Page>,
     /// Copies of the request's X (pointer) data; the request's X descriptors point here.
@@ -48,6 +49,7 @@ impl Forward {
     /// Sends `msg` (a request as received from our client, see [`snapshot`]) to
     /// `session`. `recv_size` bounds the X data of the reply (our pointer buffer size).
     pub fn start(msg: &[u8; MSG_SIZE], session: svc::Handle, recv_size: usize) -> Result<Self> {
+        reap_orphans();
         let mut page = Box::new(Page([0; 0x1000]));
         page.0[..MSG_SIZE].copy_from_slice(msg);
         let words = page.0.as_mut_ptr().cast::<u32>();
@@ -121,16 +123,40 @@ impl Forward {
 impl Drop for Forward {
     fn drop(&mut self) {
         if !self.done && svc::wait_synchronization_one(self.event, 0).is_err() {
-            // Still in flight (our client went away mid-call): the kernel may
-            // yet write these. ponytail: leaks ~2 pages per abandoned call;
-            // keep an orphan list polled by the manager if that ever adds up.
-            core::mem::forget(core::mem::take(&mut self.data));
-            core::mem::forget(core::mem::take(&mut self.recv));
-            let page = core::mem::replace(&mut self.page, Box::new(Page([0; 0x1000])));
-            core::mem::forget(page);
+            // Still in flight (our client went away mid-call): the kernel may yet write
+            // these, so they wait in ORPHANS until the real service replies.
+            let orphan = Orphan {
+                _page: core::mem::replace(&mut self.page, Box::new(Page([0; 0x1000]))),
+                _data: core::mem::take(&mut self.data),
+                _recv: core::mem::take(&mut self.recv),
+                event: self.event,
+            };
+            ORPHANS.lock().push(orphan);
+            return; // the orphan owns the event now
         }
         let _ = svc::close_handle(self.event);
     }
+}
+
+/// Buffers of an abandoned forward, kept until its reply event signals.
+struct Orphan {
+    _page: Box<Page>,
+    _data: Vec<u8>,
+    _recv: Vec<u8>,
+    event: svc::Handle,
+}
+
+impl Drop for Orphan {
+    fn drop(&mut self) {
+        let _ = svc::close_handle(self.event);
+    }
+}
+
+static ORPHANS: Mutex<Vec<Orphan>> = Mutex::new(Vec::new());
+
+/// Frees abandoned forwards whose real call has ended (the kernel is done with them).
+fn reap_orphans() {
+    ORPHANS.lock().retain(|o| svc::wait_synchronization_one(o.event, 0).is_err());
 }
 
 /// The CMIF result and output raw data of the reply in the TLS message

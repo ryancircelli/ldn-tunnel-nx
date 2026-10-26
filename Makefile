@@ -27,7 +27,7 @@ nsp:
 	@find $(SD) -type f -printf '%s\t%p\n'
 
 # `make dist`: the SD-card layout and dist/out/ldn-tunnel-<version>.zip from an already built
-# exefs.nsp (make nsp) and overlay (overlay/ builds in the devkitpro/devkita64 image).
+# exefs.nsp (make nsp) and overlay (make overlay-rs, then overlay/ builds in the devkitpro/devkita64 image).
 # Override EXEFS / OVL to take them from elsewhere (CI artifacts).
 VERSION := $(shell sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
 EXEFS   ?= $(CONTENTS)/exefs.nsp
@@ -53,15 +53,29 @@ dist:
 clean:
 	cd $(SYS) && cargo clean
 
+# `make overlay-rs`: the overlay's Rust half (crates/overlay) as the staticlib overlay/Makefile
+# links: target/aarch64-unknown-none/overlay/libldn_tunnel_overlay.a. `cargo rustc --crate-type`
+# because cargo skips LTO for a lib that is also an rlib. Then build the overlay in the
+# devkitpro/devkita64 image (docs/testing.md). `make overlay-header`: regenerate its C header
+# (cbindgen, `cargo install cbindgen --locked`); CI fails when the committed one is stale.
+OVERLAY_H := crates/overlay/include/ldn_tunnel_overlay.h
+.PHONY: overlay-rs overlay-header
+overlay-rs:
+	cargo rustc -p ldn-tunnel-overlay --target aarch64-unknown-none --profile overlay --crate-type staticlib
+overlay-header:
+	cd crates/overlay && cbindgen -q --config cbindgen.toml --output include/ldn_tunnel_overlay.h
+
 # `make test`: every host test suite (CI runs the same targets; docs/testing.md). A new suite is a
 # target below plus its name in TESTS. relay/ needs `npm ci` once.
-TESTS := test-core test-tls test-ipc test-release test-relay
+TESTS := test-core test-overlay test-tls test-ipc test-release test-relay
 .PHONY: test lint lint-host lint-sys check $(TESTS)
 test: $(TESTS)
 # the second run: the random-input tests optimised, with overflow checks (parsers must not overflow on hostile input)
 test-core:
 	cargo test -p ldn-tunnel-core
 	RUSTFLAGS=-Coverflow-checks=on cargo test --release -p ldn-tunnel-core
+test-overlay:
+	cargo test -p ldn-tunnel-overlay
 test-tls:
 	cd crates/tls && cargo test --features std --lib --test heap --test private_ca # net.rs needs internet
 # host IPC-layout tests: nx's IPC layer built for the host (vendor/nx/src/ipc_host.rs) against
@@ -69,14 +83,15 @@ test-tls:
 test-ipc:
 	cd crates/ipc-tests && cargo test
 test-release:
-	cd tools/release && node --test
+	cargo test -p ldn-tunnel-release
 test-relay:
 	cd relay && npm test && node --experimental-transform-types --disable-warning=ExperimentalWarning --test tools/hw-check.test.ts
 
 # clippy -D warnings on our crates (the vendored nx keeps its own warnings)
 lint: lint-host lint-sys
 lint-host:
-	cargo clippy -p ldn-tunnel-core --all-targets -- -D warnings
+	cargo clippy -p ldn-tunnel-core -p ldn-tunnel-overlay -p ldn-tunnel-release --all-targets -- -D warnings
+	cargo clippy -p ldn-tunnel-overlay --target aarch64-unknown-none --profile overlay -- -D warnings
 	cd crates/tls && cargo clippy --features std --all-targets -- -D warnings
 # the Horizon shell: also the deny lints in crates/sys/Cargo.toml (unsafe_code, indexing/unwrap/panic)
 lint-sys:

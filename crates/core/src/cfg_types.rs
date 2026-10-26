@@ -50,6 +50,48 @@ pub const NOTIFY_UPDATES: u32 = 1 << 0;
 pub const NOTIFY_GAME_START: u32 = 1 << 1;
 pub const NOTIFY_CONNECTION: u32 = 1 << 2;
 
+/// Command ids of the table above, for the overlay's client (crates/overlay). The module's
+/// `#[ipc_rid]`s (crates/sys/src/cfg/ifaces.rs) are checked against these in crates/ipc-tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Cmd {
+    GetVersion = 0,
+    GetConnectionStatus = 1,
+    IsServiceActive = 2,
+    IsGameActive = 3,
+    GetLdnState = 4,
+    GetSessionInfo = 5,
+    GetActiveProcessId = 8,
+    GetDebugEnabled = 9,
+    SetDebugEnabled = 10,
+    GetDebugLevel = 11,
+    SetDebugLevel = 12,
+    SaveConfig = 13,
+    ReloadConfig = 14,
+    GetServerAddress = 15,
+    SetServerAddress = 16,
+    GetLdnEnabled = 17,
+    SetLdnEnabled = 18,
+    GetTransportStatus = 25,
+    GetUpdateStatus = 26,
+    CheckForUpdates = 27,
+    GetNotifyFlags = 28,
+    SetNotifyFlags = 29,
+    GetSetupStatus = 30,
+    PrepareRestart = 31,
+}
+
+/// GetSetupStatus (30) bits (crates/sys/src/state.rs `setup_status`).
+pub const SETUP_NEEDS_RESTART: u32 = 1 << 0;
+pub const SETUP_ROLLED_BACK: u32 = 1 << 1;
+pub const SETUP_NEW_BUILD: u32 = 1 << 2;
+pub const SETUP_BUSY: u32 = 1 << 3;
+
+/// PrepareRestart (31) while a game uses the module: module 431, description 3101
+/// (crates/sys/src/cfg/service.rs `RESULT_IN_USE`).
+pub const RC_BUSY: u32 = 431 | (3101 << 9);
+const _: () = assert!(RC_BUSY == 0x183BAF);
+
 /// Relay connection state shown by the overlay (`GetConnectionStatus`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, IntoBytes, Immutable)]
 #[repr(u32)]

@@ -27,6 +27,13 @@ fn parse_hex_id(line: &[u8]) -> u64 {
     id
 }
 
+/// The id on one line (no line break), 0 for none. The overlay reads gamelist.txt line by line.
+pub fn line_id(raw: &[u8]) -> u64 {
+    let start = raw.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(raw.len());
+    let line = raw.get(start..).unwrap_or(&[]);
+    parse_hex_id(line.get(..MAX_LINE).unwrap_or(line))
+}
+
 impl Whitelist {
     pub const fn new() -> Self {
         Self { ids: Vec::new() }
@@ -38,10 +45,7 @@ impl Whitelist {
         let data = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data);
         let mut overflow = 0usize;
         for raw in data.split(|&b| b == b'\n' || b == b'\r') {
-            let start = raw.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(raw.len());
-            let line = raw.get(start..).unwrap_or(&[]);
-            let line = line.get(..MAX_LINE).unwrap_or(line);
-            let id = parse_hex_id(line);
+            let id = line_id(raw);
             if id != 0 && self.ids.push(id).is_err() {
                 overflow = overflow.saturating_add(1);
             }

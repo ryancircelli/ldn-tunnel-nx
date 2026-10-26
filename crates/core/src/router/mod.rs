@@ -15,6 +15,7 @@
 pub mod bsd;
 mod ports;
 mod ring;
+pub mod traffic;
 
 #[cfg(test)]
 mod tests;
@@ -107,7 +108,7 @@ pub enum PollState {
     Proxy { readable: bool },
 }
 
-/// Datagram counters, for logs and the overlay.
+/// Datagram counters since the last [`Router::reset`], for logs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     /// Incoming datagrams queued on at least one socket.
@@ -200,8 +201,9 @@ impl Router {
     }
 
     /// LDN disconnect: closes every proxy, frees all ports, drops pending
-    /// datagrams and the proxy config. Proxied fds answer ENETDOWN from now on.
+    /// datagrams, the proxy config and the stats. Proxied fds answer ENETDOWN from now on.
     pub fn reset(&mut self) {
+        self.stats = Stats::default();
         for s in &mut self.slots {
             s.key = None;
             s.rx.clear();

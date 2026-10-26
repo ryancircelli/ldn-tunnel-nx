@@ -1,6 +1,6 @@
 // The same relay scenarios as relay.test.ts, through the Node adapter: real HTTP server, `ws` clients,
 // node:sqlite. Runs in plain Node (the "node" vitest project).
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +19,7 @@ const ENV = {
   TOKEN_SWITCH_A: "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
   TOKEN_SWITCH_B: "", // an empty secret must never match
   TOKEN_FRIEND: "4ac281b4c9cf420d4641ab1644ce13cfde53b857ff57ac7a7ce8b09d9b52d7b9", // "b" * 63 + "c"
+  RESUME_GRACE_MS: "0", // the C# behaviour; play.ts resumeSuite covers the grace
 };
 
 let dir: string;
@@ -207,6 +208,48 @@ describe("node release source", () => {
       await m.close();
       mirror.close();
     }
+  });
+});
+
+describe("release built by tools/release (Rust)", () => {
+  // tools/release/test/bundle-rs holds manifest.bin, release.json and release.sig as `ldn-tunnel-release` wrote them
+  // (fixture key, v0.1.1 = the tag in relay/release.json, build 1700000000; the tool's tests regenerate and compare them). The three payload files are
+  // the inputs it was run on.
+  const bundle = new URL("../../tools/release/test/bundle-rs/", import.meta.url);
+  const FIXTURE_PUB = "040c81e42dc599eb75436bbe8281aff4c39ac762010a33fbc49c745842d4f811e4b6e9604a819499e3a51887ac1bbe7482b15e5ff9f48f6b941523af586998eff6";
+  const files: Record<string, Buffer> = {
+    "exefs.nsp": Buffer.from("exefs bytes"), "ldn-tunnel.ovl": Buffer.from("overlay bytes"), "relay-cloudflare.zip": Buffer.from("zip bytes"),
+    ...Object.fromEntries(["manifest.bin", "release.json", "release.sig"].map((n) => [n, readFileSync(new URL(n, bundle))])),
+  };
+  async function install(tamper?: (f: Record<string, Buffer>) => void) {
+    const served = { ...files };
+    tamper?.(served);
+    const { createServer } = await import("node:http");
+    const mirror = createServer((q, s) => {
+      const f = served[q.url!.split("/").pop()!];
+      f ? s.end(f) : s.writeHead(404).end();
+    });
+    await new Promise<void>((r) => mirror.listen(0, "127.0.0.1", r));
+    const m = await startServer({
+      port: 0, dbPath: ":memory:",
+      env: { ADMIN: "pw", PUBLISHER_KEY: FIXTURE_PUB, RELEASE_BASE_URL: `http://127.0.0.1:${(mirror.address() as { port: number }).port}/` },
+    });
+    try {
+      return await (await fetch(`http://127.0.0.1:${m.port}/api/release`, { headers: { Authorization: "Bearer pw" } })).json() as any;
+    } finally {
+      await m.close();
+      mirror.close();
+    }
+  }
+  it("is verified and installed", async () => {
+    const body = await install();
+    expect(body.installError).toBeUndefined();
+    expect(body.deployed).toEqual({ version: "0.1.1", build: 1700000000 });
+  });
+  it("a flipped release.sig bit is refused", async () => {
+    const body = await install((f) => (f["release.sig"] = Buffer.from(f["release.sig"]), f["release.sig"][63] ^= 1));
+    expect(body.installError).toContain("bad publisher signature");
+    expect(body.deployed.build).toBeNull();
   });
 });
 

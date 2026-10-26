@@ -8,8 +8,9 @@
 //! - nifm / time: libnx `nifm.c` (`_nifmCreateGeneralService`, `nifmGetCurrentIpConfigInfo`)
 //!   and `time.c` (GetStandardUserSystemClock / GetStandardNetworkSystemClock,
 //!   `timeGetCurrentTime`), definitions in crates/sys/src/net/ipc.rs.
-//! - ldnt:cfg: the overlay's client, overlay/source/ldn_tunnel_ipc.c (libnx serviceDispatchIn /
-//!   Out), served by crates/sys/src/cfg/ifaces.rs.
+//! - ldnt:cfg: served by crates/sys/src/cfg/ifaces.rs; the overlay's client is
+//!   crates/overlay/src/cfg.rs (bytes through libnx serviceDispatchImpl, overlay/source/platform.c),
+//!   run against that server in `cfg_overlay_client`.
 
 mod common;
 
@@ -284,9 +285,9 @@ fn cfg_u32_getters_and_setters() {
 
 #[test]
 fn cfg_structs() {
-    // ldnTunnelGetVersion: char[32]; GetSessionInfo: LdnTunnelSessionInfo (4 x u8 + 4 reserved);
+    // GetVersion: char[32]; GetSessionInfo: SessionInfoIpc (4 x u8 + 4 reserved);
     // GetActiveProcessId: u64; Save/ReloadConfig: u32 result; GetTransportStatus: char[64];
-    // GetUpdateStatus: LdnTunnelUpdateStatus (3 x u32, 4 x u8, char[31], u8 download: 48).
+    // GetUpdateStatus: UpdateStatusIpc (3 x u32, 4 x u8, char[31], u8 download: 48).
     assert_eq!(&cfg(0, vec![], 32).1[..7], b"v1.2.3\0");
     assert_eq!(cfg(5, vec![], 8).1, [2, 8, 1, 0, 0, 0, 0, 0]);
     assert_eq!(cfg(8, vec![], 8).1, le!(0x51u64));
@@ -299,7 +300,7 @@ fn cfg_structs() {
 
 #[test]
 fn cfg_server_address() {
-    // ldnTunnelGet/SetServerAddress: { char host[64]; u16 port; u16 padding; } (68 bytes).
+    // Get/SetServerAddress: { char host[64]; u16 port; u16 padding; } (68 bytes).
     let out = cfg(15, vec![], 68).1;
     assert_eq!((&out[..12], &out[64..66]), (&b"example.org\0"[..], &le!(30456u16)[..]));
     let mut host = [0u8; 64];
@@ -310,7 +311,59 @@ fn cfg_server_address() {
 
 #[test]
 fn cfg_commands_without_data() {
-    // ldnTunnelCheckForUpdates / ldnTunnelPrepareRestart: serviceDispatch, no data.
+    // CheckForUpdates / PrepareRestart: no data either way.
     assert_eq!(cfg(27, vec![], 0).0, ["check_for_updates"]);
     assert_eq!(cfg(31, vec![], 0).0, ["prepare_restart"]);
+}
+
+/// The overlay's client (crates/overlay/src/cfg.rs) against the module's server object: command
+/// ids (the getters answer 0x100 + id) and the request / reply sizes and layouts agree.
+#[derive(Default)]
+struct Overlay(Vec<String>);
+
+impl ldn_tunnel_overlay::cfg::Dispatch for Overlay {
+    fn dispatch(&mut self, cmd: u32, input: &[u8], out: &mut [u8]) -> u32 {
+        let (log, raw) = cfg(cmd, input.to_vec(), out.len());
+        assert_eq!(raw.len(), out.len(), "cmd {cmd}: reply shorter than the client reads");
+        out.copy_from_slice(&raw);
+        self.0.extend(log);
+        0
+    }
+}
+
+#[test]
+fn cfg_overlay_client() {
+    use ldn_tunnel_overlay::cfg as c;
+    let mut s = Overlay::default();
+    assert_eq!(&c::version(&mut s).unwrap()[..7], b"v1.2.3\0");
+    assert_eq!(c::connection_status(&mut s), Ok(0x101));
+    assert_eq!(c::is_game_active(&mut s), Ok(true));
+    assert_eq!(c::ldn_state(&mut s), Ok(0x104));
+    let si = c::session_info(&mut s).unwrap();
+    assert_eq!((si.node_count, si.max_nodes, si.local_node_id, si.is_host), (2, 8, 1, 0));
+    assert_eq!(c::debug_enabled(&mut s), Ok(true));
+    c::set_debug_enabled(&mut s, true).unwrap();
+    assert_eq!(c::debug_level(&mut s), Ok(0x10B));
+    c::set_debug_level(&mut s, 3).unwrap();
+    assert_eq!(c::save_config(&mut s), Ok(false), "IoError");
+    assert_eq!(c::reload_config(&mut s), Ok(false), "ParseError");
+    let a = c::server_address(&mut s).unwrap();
+    assert_eq!((&a.host[..12], a.port), (&b"example.org\0"[..], 30456));
+    assert_eq!(c::ldn_enabled(&mut s), Ok(true));
+    c::set_ldn_enabled(&mut s, false).unwrap();
+    assert_eq!(&c::transport_status(&mut s).unwrap()[..3], b"ok\0");
+    let up = c::update_status(&mut s).unwrap();
+    assert_eq!((up.running_build, up.channel, up.download), (7, 2, 51));
+    c::check_for_updates(&mut s).unwrap();
+    assert_eq!(c::notify_flags(&mut s), Ok(0x11C));
+    c::set_notify_flags(&mut s, 5).unwrap();
+    assert_eq!(c::setup_status(&mut s), Ok(0x11E));
+    c::prepare_restart(&mut s).unwrap();
+    assert_eq!(
+        s.0,
+        [
+            "get 1", "get 3", "get 4", "get 9", "set 10 0x1", "get 11", "set 12 0x3", "get 17", "set 18 0x0",
+            "check_for_updates", "get 28", "set 29 0x5", "get 30", "prepare_restart"
+        ]
+    );
 }

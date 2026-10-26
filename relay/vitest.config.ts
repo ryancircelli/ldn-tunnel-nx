@@ -31,6 +31,7 @@ export default defineConfig({
                 TEST_PUBLISHER_PRIVATE_PEM: publisher.privateKey,
                 CF_API_TOKEN: "cf-test-token",
                 CF_ACCOUNT_ID: "acct123",
+                RESUME_GRACE_MS: "0", // the C# behaviour (leave at once); the resume tests turn the grace on
                 TOKEN_FRIEND: "4ac281b4c9cf420d4641ab1644ce13cfde53b857ff57ac7a7ce8b09d9b52d7b9", // "b" * 63 + "c"
               },
             },
