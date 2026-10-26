@@ -1,7 +1,17 @@
 # ldn-tunnel
 
+[![ci](https://github.com/ryancircelli/ldn-tunnel-nx/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ryancircelli/ldn-tunnel-nx/actions/workflows/ci.yml?query=branch%3Amain)
+[![coverage (Rust core)](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/ryancircelli/ldn-tunnel-nx/badges/rust-core.json)](docs/testing.md#coverage)
+[![coverage (relay)](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/ryancircelli/ldn-tunnel-nx/badges/relay.json)](docs/testing.md#coverage)
+[![Rust](https://img.shields.io/badge/Rust-no__std-orange?logo=rust)](crates/sys/README.md)
+[![release](https://img.shields.io/github/v/release/ryancircelli/ldn-tunnel-nx)](https://github.com/ryancircelli/ldn-tunnel-nx/releases/latest)
+[![license: GPL-2.0-or-later](https://img.shields.io/badge/license-GPL--2.0--or--later-blue)](LICENSE)
+[![relay license: MIT](https://img.shields.io/badge/relay%20license-MIT-blue)](relay/LICENSE)
+
 Play Switch local-wireless games with friends over the internet, through a relay that you run
 yourself for free on Cloudflare.
+
+The console module is written in Rust (`no_std`) and runs on the Switch as an Atmosphère sysmodule.
 
 ## Setup
 
