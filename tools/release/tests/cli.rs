@@ -211,7 +211,7 @@ fn typescript_tool_output_is_reproduced_and_accepted() {
 fn rust_golden_bundle_is_reproducible() {
     let d = dir("rs-golden");
     inputs(&d);
-    sign(&d, "v0.1.1", &fixture_key());
+    sign(&d, "v0.1.2", &fixture_key());
     for f in ["manifest.bin", "release.json", "release.sig"] {
         assert_eq!(fs::read(d.join(f)).unwrap(), fs::read(fixtures().join("bundle-rs").join(f)).unwrap(), "{f} differs from test/bundle-rs");
     }

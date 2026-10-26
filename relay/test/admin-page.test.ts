@@ -54,6 +54,11 @@ describe("logic", () => {
     expect(same.text).toContain("Up to date");
     expect(L.releaseState({ deployed: dep, platform: "cloudflare" }).newer).toBe(false);
   });
+  it("says when the console files are not the deployed code's yet", () => {
+    const s = L.releaseState({ deployed: { version: "0.1.1", build: null }, consoleFiles: { version: "0.1.0", build: 5 }, platform: "cloudflare" });
+    expect(s.text).toContain("Consoles still get the v0.1.0 files until v0.1.1's are installed.");
+    expect(L.releaseState({ deployed: { version: "0.1.1", build: 6 }, consoleFiles: { version: "0.1.1", build: 6 } }).text).not.toContain("Consoles");
+  });
   it("falls back to semver without builds", () => {
     expect(L.releaseState({ deployed: { version: "1.9.0" }, latest: { version: "1.10.0" }, platform: "cloudflare" }).newer).toBe(true);
   });

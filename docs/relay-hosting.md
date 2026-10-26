@@ -82,21 +82,25 @@ the Deploy form, `CF_API_TOKEN` and `CF_ACCOUNT_ID`, plus the variable `CF_WORKE
 `POST /api/update {version?}` (default: the latest release) runs these steps:
 
 1. Download `release.json` and `release.sig` of tag `v<version>` from
-   `https://github.com/<repo>/releases/download/<tag>/`. The latest release is read from
-   `…/releases/latest/download/`, which needs no GitHub API call and has no rate limit.
+   `https://github.com/<repo>/releases/download/<tag>/`, or `…/releases/latest/download/` for the latest
+   release, with retries and the REST API fallback for GitHub's rate limit (`docs/relay-releases.md`).
 2. Check the publisher signature. Then check every asset against `release.json`, and check
    `manifest.bin` (format 2, publisher-signed, naming exactly these console files).
 3. Store the console files as blobs.
 4. Upload `relay-cloudflare.zip` as a new version and deploy it at 100%.
-5. Only then point the `ldn-tunnel/release` channel at the new manifest.
+5. Only then point the `ldn-tunnel/release` channel at the new manifest. The release it replaces stays
+   stored as `ldn-tunnel/release-previous` (manifest and blobs), which no console asks for.
 
 The relay and the console module therefore move together. If the deploy fails, consoles keep the old
 module. Bindings sent: the `LOBBY` Durable Object. `keep_bindings`: `secret_text`, `secret_key`,
 `plain_text`, `json`, so the secrets and variables set on the Deploy form survive the update.
 
-`POST /api/rollback` rolls the Worker back only. Consoles are not downgraded: the module refuses a
-lower build (`crates/core/src/update.rs`). The rolled-back relay keeps serving the newer module it
-already stored until its own `release.json` tag is installed again.
+`POST /api/rollback` rolls the Worker back. The rolled-back code then serves its own `release.json` tag
+again: on the first admin release view, ldn-tunnel update check or invite, it finds that release in
+`ldn-tunnel/release-previous` and swaps the two, with no download (relays updated before this existed
+download it). Until then `/api/release` shows the mismatch: `deployed.build` is null and `consoleFiles`
+names the release still served. Consoles are not downgraded either way: the module refuses a lower build
+(`crates/core/src/update.rs`).
 
 ### Caveat: the user's repository copy
 

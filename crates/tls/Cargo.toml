@@ -1,7 +1,7 @@
 [package]
 name = "ldn-tunnel-tls"
 description = "Blocking no_std TLS client (rustls + RustCrypto) over a caller-supplied byte transport"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "GPL-2.0-or-later"
 publish = false

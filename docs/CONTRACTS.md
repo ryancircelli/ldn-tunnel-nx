@@ -58,7 +58,8 @@ registers the socket under `s.sid`, `await open(conn, s)`; then `message(conn, b
 - `GET /api/consoles/:id/logs?limit=` → `[{at, line}]` (default 200, max 2000)
 - `GET /api/drops?limit=` → newest first, last 500: `{at, ev: "drop", who, by: relay|peer|error, code, reason, clean, colo, country, age_s, frames_in, frames_out, idle_in_ms, idle_out_ms, do_start, same_sec}` , `{at, ev: "relay-start", sockets: 0}`, and the resume outcomes `{at, ev: "resume", awayMs, ..}` / `{at, ev: "leave", why: "not resumed", ..}` / `{at, ev: "resume-refused", ..}` (drop and start rows: Cloudflare only; `relay/src/core/drops.ts`; `npm run drops` lays them next to the consoles' `relay: link ended` lines)
 - `POST /api/invites` {name?} → `{url, expiresAt}` · `GET /invite/:token` → HTML page with a download button · `POST /invite/:token` → zip, consumes the invite (one-time, 24 h; a link preview's GET never uses it up)
-- `GET /api/release` → `{deployed: {version, build}, latest?: {version, build, url}, platform, canSelfUpdate, updateCommand?, installError?}`
+- `GET /api/release` → `{deployed: {version, build}, consoleFiles: {version, build} | null, latest?: {version, build, url}, platform, canSelfUpdate, updateCommand?, installError?}`.
+  `deployed.version` is the relay code's release; `consoleFiles` the console release served now. `deployed.build` is null while they differ.
 - `POST /api/update` {version?} (default latest; needs a `Deployer`, i.e. Cloudflare with `CF_API_TOKEN` + `CF_ACCOUNT_ID`) · `POST /api/rollback`
 - Owner update routes (`UPDATE_ADMIN` bearer), per module by path: `PUT /update/channel/test`, `POST /update/promote` (C++ module), `PUT /update/ldn-tunnel/channel/test`, `POST /update/ldn-tunnel/promote`, `PUT /update/blob/:sha256`, `GET /update/status`. Details: docs/relay-releases.md.
 

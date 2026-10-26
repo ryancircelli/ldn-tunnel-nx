@@ -145,9 +145,7 @@ export async function adminApi(r: Relay, req: Request): Promise<Response> {
     if (path === "/api/release" && m === "GET") return json(await release(r));
     if (path === "/api/update" && m === "POST") {
       const v = (await body(req)).version;
-      const tag = typeof v === "string" && v ? tagOf(v) : (await latest(r))?.tag;
-      if (!tag) return fail(502, "could not find the latest release");
-      await update(r, tag);
+      const tag = await update(r, typeof v === "string" && v ? tagOf(v) : "latest");
       return json({ ok: true, version: tag.slice(1) });
     }
     if (path === "/api/rollback" && m === "POST") {
@@ -216,8 +214,12 @@ async function release(r: Relay) {
   await ensureInstalled(r).catch((e: Error) => (error = e.message));
   const l = await latest(r);
   const docker = r.host.platform === "docker";
+  const i = installed(r);
   return {
-    deployed: { version: PIN.tag.slice(1), build: installed(r)?.build ?? null },
+    // the relay code; build: of its console files, null until they are the ones served
+    deployed: { version: PIN.tag.slice(1), build: i?.tag === PIN.tag ? i.build : null },
+    // the console files consoles and invites get now; differs from `deployed` until ensureInstalled succeeds
+    consoleFiles: i ? { version: i.tag.slice(1), build: i.build } : null,
     latest: l && { version: l.tag.slice(1), build: l.build, url: `https://github.com/${PIN.repo}/releases/tag/${l.tag}` },
     platform: r.host.platform,
     canSelfUpdate: !!r.host.deployer,

@@ -23,7 +23,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 # (NAME, OVERLAY_PATH = sdmc:/switch/.overlays/ldn-tunnel.ovl; the Rust half takes
 # CFG_SERVICE and PROGRAM_ID_HEX from there).
 NAME        := ldn-tunnel
-TARGET_VERSION := 0.1.1
+TARGET_VERSION := 0.1.2
 VERSION_DEFINES := -DLDNT_VERSION="\"${TARGET_VERSION}\""
 
 APP_TITLE   := $(NAME)

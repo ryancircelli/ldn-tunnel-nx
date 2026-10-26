@@ -32,7 +32,12 @@ nothing else, unless the owner publishes a channel. It downloads them on first n
 release view, the first ldn-tunnel update check, or the first invite.
 
 All files come from `https://github.com/<repo>/releases/download/<tag>/<asset>`, or
-`…/releases/latest/download/…` for "latest" (no GitHub API, no rate limit). Each must pass:
+`…/releases/latest/download/…` for "latest", one at a time. GitHub rate-limits these per IP, and Workers
+share egress IPs: a 429 (or 5xx) is retried up to twice, after `Retry-After` when that is at most 10 s, else
+after 1 s and 2 s. If a file is still refused, it and the rest come from the REST API instead
+(`api.github.com/repos/<repo>/releases/tags/<tag>`, each `assets[].url` with `Accept:
+application/octet-stream`), which has its own limit. Still refused: the error is "GitHub is rate-limiting
+this relay, try again in a minute". With `RELEASE_BASE_URL` set there is no API fallback. Each must pass:
 
 1. `release.sig`: 64 bytes, ECDSA P-256 / SHA-256 over the exact bytes of `release.json`, raw r‖s. It is
    checked against the publisher key, a 65-byte point (`04‖X‖Y`) given in hex in

@@ -9,7 +9,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { PacketId, UpdateCheckRequest } from "../src/core/codec/types.ts";
 import { Ldn } from "../tools/ldn-client.ts";
 import { encodeManifest, signManifest } from "../tools/update-manifest.ts";
-import { PIN } from "../src/core/release.ts";
+import { PIN, RATE_LIMITED } from "../src/core/release.ts";
 import { cloudflareDeployer } from "../src/cloudflare/lobby.ts";
 
 const e = env as unknown as Record<string, string>;
@@ -46,6 +46,8 @@ type Call = { url: string; init?: RequestInit };
 let calls: Call[] = [];
 let github: Record<string, Uint8Array> = {};
 let cloudflare: (url: string, init?: RequestInit) => Response = () => new Response("{}", { status: 500 });
+let rateLimit: (url: string) => Response | undefined = () => undefined;
+const tooMany = (retryAfter = "0") => new Response("rate limited", { status: 429, headers: { "retry-after": retryAfter } });
 const realFetch = globalThis.fetch;
 const gh = (tag: string, name: string) => `https://github.com/${PIN.repo}/releases/download/${tag}/${name}`;
 
@@ -67,11 +69,14 @@ beforeAll(async () => {
 beforeEach(() => {
   calls = [];
   github = {};
+  rateLimit = () => undefined;
   serve(pinned, true);
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = input instanceof Request ? input.url : String(input);
-    if (url.startsWith("https://github.com/")) {
-      calls.push({ url });
+    if (url.startsWith("https://github.com/") || url.startsWith("https://api.github.com/")) {
+      calls.push({ url, init });
+      const limited = rateLimit(url);
+      if (limited) return limited;
       const b = github[url];
       return b ? new Response(b) : new Response("not found", { status: 404 });
     }
@@ -425,9 +430,9 @@ describe("Cloudflare self-update", () => {
     expect(dec.decode(await part.arrayBuffer())).toContain("9.9.9");
     expect(form.has("metadata.json")).toBe(false);
     expect(JSON.parse(cf[1].init!.body as string)).toEqual({ strategy: "percentage", versions: [{ version_id: "ver-" + versions, percentage: 100 }] });
-    const { c } = await connect("a".repeat(64));
-    c!.send(PacketId.UpdateCheck, updateCheck(1));
-    expect(await c!.expect(PacketId.UpdateManifest)).toEqual(next.manifest);
+    // what the new Worker serves (a check here would run this test's pinned code, which restores its own release)
+    const [row] = await sqlRun("SELECT manifest FROM channels WHERE name = 'ldn-tunnel/release'");
+    expect(new Uint8Array(row.manifest as ArrayBuffer)).toEqual(next.manifest);
   });
 
   it("a tampered Worker bundle is never deployed and the console files stay", async () => {
@@ -461,6 +466,77 @@ describe("Cloudflare self-update", () => {
   it("a Cloudflare API error is reported, not swallowed", async () => {
     cloudflare = () => Response.json({ success: false, errors: [{ message: "Authentication error" }] }, { status: 403 });
     expect((await apiJson("/api/rollback", "POST")).body.error).toContain("Authentication error");
+  });
+
+  it("a 429 is retried after Retry-After, with a User-Agent naming the relay", async () => {
+    serve(next);
+    const seen = new Set<string>();
+    rateLimit = (url) => (seen.has(url) ? undefined : (seen.add(url), tooMany()));
+    expect((await apiJson("/api/update", "POST", { version: "9.9.9" })).body).toEqual({ ok: true, version: "9.9.9" });
+    const gets = calls.filter((c) => c.url.startsWith("https://github.com/")).map((c) => c.url);
+    expect(gets).toEqual([...new Set(gets)].flatMap((u) => [u, u])); // each file: one 429, one retry, one at a time
+    expect(gets.filter((u, i) => i % 2 === 0).map((u) => u.split("/").pop())).toEqual(
+      ["release.json", "release.sig", "manifest.bin", "exefs.nsp", "ldn-tunnel.ovl", "relay-cloudflare.zip"]);
+    expect(new Headers(calls[0].init?.headers).get("User-Agent")).toBe(`ldn-tunnel-relay/${PIN.tag} (+https://github.com/${PIN.repo})`);
+  });
+
+  it("downloads that stay rate-limited come through the GitHub API's asset URLs", async () => {
+    serve(next);
+    const assets = Object.entries(next.assets).map(([name, b], i) => {
+      const url = `https://api.github.com/repos/${PIN.repo}/releases/assets/${i}`;
+      github[url] = b;
+      return { name, url };
+    });
+    github[`https://api.github.com/repos/${PIN.repo}/releases/tags/v9.9.9`] = enc.encode(JSON.stringify({ assets }));
+    rateLimit = (url) => (url.startsWith("https://github.com/") ? tooMany() : undefined);
+    expect((await apiJson("/api/update", "POST", { version: "9.9.9" })).body).toEqual({ ok: true, version: "9.9.9" });
+    const gh = calls.filter((c) => c.url.includes("github.com/"));
+    expect(gh.filter((c) => c.url.startsWith("https://github.com/")).map((c) => c.url)).toEqual(Array(3).fill(gh[0].url)); // release.json only
+    const fromApi = gh.filter((c) => c.url.includes("/releases/assets/"));
+    expect(fromApi).toHaveLength(Object.keys(next.assets).length);
+    expect(fromApi.every((c) => new Headers(c.init?.headers).get("Accept") === "application/octet-stream")).toBe(true);
+  });
+
+  it("rate-limited everywhere: nothing is deployed and the error says so", async () => {
+    serve(next);
+    rateLimit = () => tooMany();
+    const { status, body } = await apiJson("/api/update", "POST", {});
+    expect(status).toBe(502);
+    expect(body.error).toBe(RATE_LIMITED);
+    expect(calls.filter((c) => c.url.includes("github.com/"))).toHaveLength(6); // 3 tries direct, 3 via the API
+    expect(calls.some((c) => c.url.startsWith("https://api.cloudflare.com/"))).toBe(false);
+    rateLimit = () => tooMany("3600");
+    calls = [];
+    expect((await apiJson("/api/update", "POST", { version: "9.9.9" })).body.error).toBe(RATE_LIMITED);
+    expect(calls).toHaveLength(2); // an hour's Retry-After is not waited out
+  });
+
+  it("after a rollback the code's own release is served again, from storage; a mismatch shows in /api/release", async () => {
+    await sqlRun("DELETE FROM kv WHERE k IN ('installed', 'previous')");
+    await apiJson("/api/release"); // the pinned release
+    serve(next);
+    expect((await apiJson("/api/update", "POST", { version: "9.9.9" })).body.ok).toBe(true);
+    // this isolate runs the pinned code, as the rolled-back Worker does: its first ldn-tunnel check restores
+    // the pinned release without GitHub
+    github = {};
+    calls = [];
+    const { c } = await connect("a".repeat(64));
+    c!.send(PacketId.UpdateCheck, updateCheck(1));
+    expect(await c!.expect(PacketId.UpdateManifest)).toEqual(pinned.manifest);
+    const { body } = await apiJson("/api/release");
+    expect(body).toMatchObject({ deployed: { version: PIN.tag.slice(1), build: 1001 }, consoleFiles: { version: PIN.tag.slice(1), build: 1001 } });
+    expect(calls.filter((c) => !c.url.includes("/latest/"))).toEqual([]);
+
+    // without the stored copy (a relay updated before this existed) it downloads, and until then says so
+    serve(next);
+    await apiJson("/api/update", "POST", { version: "9.9.9" });
+    await sqlRun("DELETE FROM kv WHERE k = 'previous'");
+    rateLimit = () => tooMany();
+    const mixed = (await apiJson("/api/release")).body;
+    expect(mixed).toMatchObject({ deployed: { version: PIN.tag.slice(1), build: null }, consoleFiles: { version: "9.9.9", build: 1002 }, installError: RATE_LIMITED });
+    rateLimit = () => undefined;
+    serve(pinned);
+    expect((await apiJson("/api/release")).body).toMatchObject({ deployed: { build: 1001 }, consoleFiles: { build: 1001 } });
   });
 
   it("no deployer without all three settings", () => {

@@ -213,7 +213,7 @@ describe("node release source", () => {
 
 describe("release built by tools/release (Rust)", () => {
   // tools/release/test/bundle-rs holds manifest.bin, release.json and release.sig as `ldn-tunnel-release` wrote them
-  // (fixture key, v0.1.1 = the tag in relay/release.json, build 1700000000; the tool's tests regenerate and compare them). The three payload files are
+  // (fixture key, v0.1.2 = the tag in relay/release.json, build 1700000000; the tool's tests regenerate and compare them). The three payload files are
   // the inputs it was run on.
   const bundle = new URL("../../tools/release/test/bundle-rs/", import.meta.url);
   const FIXTURE_PUB = "040c81e42dc599eb75436bbe8281aff4c39ac762010a33fbc49c745842d4f811e4b6e9604a819499e3a51887ac1bbe7482b15e5ff9f48f6b941523af586998eff6";
@@ -244,7 +244,7 @@ describe("release built by tools/release (Rust)", () => {
   it("is verified and installed", async () => {
     const body = await install();
     expect(body.installError).toBeUndefined();
-    expect(body.deployed).toEqual({ version: "0.1.1", build: 1700000000 });
+    expect(body.deployed).toEqual({ version: "0.1.2", build: 1700000000 });
   });
   it("a flipped release.sig bit is refused", async () => {
     const body = await install((f) => (f["release.sig"] = Buffer.from(f["release.sig"]), f["release.sig"][63] ^= 1));

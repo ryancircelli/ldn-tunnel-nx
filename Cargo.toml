@@ -7,7 +7,7 @@ exclude = ["crates/sys", "crates/tls", "relay", "overlay"]
 default-members = ["crates/core", "crates/overlay", "tools/release"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "GPL-2.0-or-later"
 

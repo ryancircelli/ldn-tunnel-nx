@@ -48,6 +48,8 @@ function releaseState(d) {
   s.error = d.installError || null;
   s.showCommand = s.newer && d.platform === "docker" && !!s.command;
   s.text = s.newer ? "Deployed " + s.deployed + ". " + s.latest + " is available." : "Deployed " + s.deployed + ". Up to date.";
+  const cf = d.consoleFiles;
+  if (cf && cf.version !== dep.version) s.text += " Consoles still get the v" + cf.version + " files until v" + dep.version + "'s are installed.";
   return s;
 }
 function inviteHint(r) {

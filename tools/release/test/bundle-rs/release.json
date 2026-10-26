@@ -1,5 +1,5 @@
 {
-  "version": "v0.1.1",
+  "version": "v0.1.2",
   "build": 1700000000,
   "assets": {
     "exefs.nsp": {
@@ -11,7 +11,7 @@
       "size": 13
     },
     "manifest.bin": {
-      "sha256": "6f3406e4e1bf08c60b40d43597d5845ce1c36b81ce4927faabc1c2de9c372816",
+      "sha256": "77b755ac6728d7921cbfc4a0077341264d39bc9e3ea5651c4048b882e1c5c5e1",
       "size": 192
     },
     "relay-cloudflare.zip": {

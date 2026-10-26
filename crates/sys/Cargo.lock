@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "ldn-tunnel-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "heapless",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "ldn-tunnel-sys"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "embedded-io",
  "getrandom",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "ldn-tunnel-tls"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "embedded-io",
  "getrandom",
