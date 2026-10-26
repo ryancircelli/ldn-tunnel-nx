@@ -82,6 +82,57 @@ jobs:
         working-directory: relay
       - run: make test-relay # tsc --noEmit, vitest (workerd + Node), tools/hw-check.test.ts
 
+  # `make coverage` (docs/testing.md). On main the badges job publishes the numbers for the README.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (rust-toolchain.toml, has llvm-tools)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates/tls
+            crates/ipc-tests
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: relay/package-lock.json
+      - run: npm ci
+        working-directory: relay
+      - run: make coverage BADGES=badges
+      - uses: actions/upload-artifact@v4
+        with:
+          name: badges
+          path: badges
+
+  # The shields.io endpoint files to the orphan branch `badges`: one commit, force-pushed, no other branch
+  # touched. Runs none of the repo's code, so it alone gets write access.
+  badges:
+    needs: coverage
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'ryancircelli/ldn-tunnel-nx'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: badges
+          path: badges
+      - name: Push the badges branch
+        working-directory: badges
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          git init -q -b badges
+          git add -- *.json
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -qm "coverage badges for $GITHUB_SHA"
+          git push -f "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/badges
+
   # The Docker image through docker run and the real docker-compose.yml + Caddy, against a fake GitHub release.
   relay-docker:
     runs-on: ubuntu-latest

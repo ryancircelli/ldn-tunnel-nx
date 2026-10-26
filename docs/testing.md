@@ -36,6 +36,7 @@ name in `TESTS`.
 - **relay-docker**: `npm run test:e2e-docker`.
 - **release-tools**: `make test-release`.
 - **licenses**: `cargo deny check licenses` for the three Rust trees.
+- **coverage**: `make coverage` (below); on `main` the **badges** job puts the numbers on the `badges` branch for the README.
 
 ### Binary gates (`make check`, `tools/check-elf.sh`)
 
@@ -52,6 +53,12 @@ Two kinds of failure only show up on a console, so the gates check the built bin
 Both limits are environment variables, e.g. `FRAME_MAX=16384 make check`. Raising one belongs in its
 own commit that says why. `tools/check-elf.sh --self-test` checks the frame parser against small
 functions compiled with `llc`.
+
+## Coverage
+
+`make coverage` (needs `cargo install cargo-llvm-cov`) prints the line coverage of the host tests: crates/core (the
+README badge), crates/tls, the vendored nx IPC layer crates/ipc-tests builds for the host, and relay/src.
+crates/sys is not measured: it only runs on a Switch.
 
 ## Hardware test (two consoles)
 

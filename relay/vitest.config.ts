@@ -12,6 +12,8 @@ const publisher = generateKeyPairSync("ec", {
 
 export default defineConfig({
   test: {
+    // `npm run coverage` (`make coverage`): relay/src line coverage across both projects
+    coverage: { provider: "v8", include: ["src/**"], reporter: ["text-summary", "json-summary"] },
     projects: [
       {
         // Cloudflare: the Durable Object adapter inside workerd

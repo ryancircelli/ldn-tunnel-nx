@@ -86,3 +86,15 @@ lint-sys:
 check:
 	tools/check-elf.sh --self-test
 	tools/check-elf.sh
+
+# `make coverage`: line coverage of the host tests (cargo-llvm-cov, vitest + v8), printed by tools/coverage.mjs.
+# BADGES=<dir> also writes the shields.io badge files CI publishes. crates/sys only runs on a Switch: not measured.
+COV := $(CURDIR)/target/coverage
+.PHONY: coverage
+coverage:
+	mkdir -p $(COV)
+	cargo llvm-cov -p ldn-tunnel-core --json --summary-only --output-path $(COV)/core.json
+	cd crates/tls && cargo llvm-cov --features std --lib --test heap --test private_ca --json --summary-only --output-path $(COV)/tls.json
+	cd crates/ipc-tests && cargo llvm-cov --json --summary-only --output-path $(COV)/ipc.json
+	cd relay && npm run coverage
+	node tools/coverage.mjs $(BADGES)

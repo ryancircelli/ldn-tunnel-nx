@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "test": "tsc --noEmit && vitest run",
+    "coverage": "vitest run --coverage",
     "logs": "node --experimental-transform-types tools/logs.ts",
     "release": "node --experimental-transform-types tools/release.ts",
     "promote": "node --experimental-transform-types tools/promote.ts",
@@ -18,6 +19,7 @@
     "@cloudflare/vitest-plugin": "^1.4.4",
     "@types/node": "^22.20.5",
     "@types/ws": "^8.18.2",
+    "@vitest/coverage-v8": "~4.1",
     "typescript": "^5.9.3",
     "vitest": "~4.1",
     "wrangler": "^4.151.1"
