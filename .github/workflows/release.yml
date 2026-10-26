@@ -108,6 +108,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dl
+          # Not the docker build record that docker/build-push-action uploads.
+          pattern: "{module,overlay,relay}"
       - name: Assemble the bundle
         run: |
           mkdir bundle
